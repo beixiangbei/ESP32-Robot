@@ -16,6 +16,7 @@ ESP32-Robot Skill - AI Agent 具身交互控制库
 import requests
 import time
 import sys
+import json
 import argparse
 from typing import Optional
 
@@ -30,7 +31,7 @@ class ESP32RobotSkill:
         # 默认参数
         self.face_line = 2      # 表情显示行
         self.face_size = 3      # 表情字号
-        self.led_brightness = 80  # LED默认亮度
+        self.led_brightness = 10  # LED默认亮度（不晃眼）
         self.default_speed = 8   # 默认速度
 
         # 表情预设配置 (所有表情3字符, size=3, line=2)
@@ -100,7 +101,9 @@ class ESP32RobotSkill:
         Returns:
             {"ok": True, "text": text, ...}
         """
-        data = {"text": text}
+        # 固件会在文本两端加引号，发送前剥掉避免出现双引号
+        clean_text = text.strip('"')
+        data = {"text": clean_text}
 
         if "x" in kwargs:
             data["x"] = kwargs["x"]
@@ -114,10 +117,22 @@ class ESP32RobotSkill:
             data["size"] = self.face_size
 
         try:
-            r = requests.post(f"{self.api}/oled/text", json=data, timeout=5)
-            # ESP32返回的JSON可能有问题，手动解析
+            r = requests.post(
+                f"{self.api}/oled/text",
+                data=json.dumps(data, separators=(",", ":")),
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept-Encoding": "identity",
+                },
+                timeout=5,
+            )
             if r.status_code == 200:
-                return {"ok": True, "text": text}
+                # 固件返回的JSON中text字段带多余引号，手动提取
+                try:
+                    text_val = json.loads(r.text).get("text", clean_text)
+                    return {"ok": True, "text": text_val}
+                except Exception:
+                    return {"ok": True, "text": clean_text}
             return {"error": f"HTTP {r.status_code}"}
         except Exception as e:
             return {"error": str(e)}
@@ -134,7 +149,12 @@ class ESP32RobotSkill:
         Args:
             rotation: 0=0°, 1=90°, 2=180°, 3=270°
         """
-        r = requests.post(f"{self.api}/oled/rotation", json={"rotation": rotation}, timeout=5)
+        r = requests.post(
+            f"{self.api}/oled/rotation",
+            data=json.dumps({"rotation": rotation}, separators=(",", ":")),
+            headers={"Content-Type": "application/json", "Accept-Encoding": "identity"},
+            timeout=5,
+        )
         return r.json()
 
     # ========== LED 系统 ==========
@@ -166,7 +186,12 @@ class ESP32RobotSkill:
             data["speed"] = speed
 
         try:
-            r = requests.post(f"{self.api}/led/effect", json=data, timeout=5)
+            r = requests.post(
+                f"{self.api}/led/effect",
+                data=json.dumps(data, separators=(",", ":")),
+                headers={"Content-Type": "application/json", "Accept-Encoding": "identity"},
+                timeout=5,
+            )
             if r.status_code == 200:
                 return {"ok": True}
             return {"error": f"HTTP {r.status_code}"}
@@ -211,14 +236,24 @@ class ESP32RobotSkill:
             data = {"motor": 0, "target": pan}
             if speed:
                 data["speed"] = speed
-            r = requests.post(f"{self.api}/motor/absolute", json=data, timeout=5)
+            r = requests.post(
+                f"{self.api}/motor/absolute",
+                data=json.dumps(data, separators=(",", ":")),
+                headers={"Content-Type": "application/json", "Accept-Encoding": "identity"},
+                timeout=5,
+            )
             results.append(r.json())
 
         if tilt is not None:
             data = {"motor": 1, "target": tilt}
             if speed:
                 data["speed"] = speed
-            r = requests.post(f"{self.api}/motor/absolute", json=data, timeout=5)
+            r = requests.post(
+                f"{self.api}/motor/absolute",
+                data=json.dumps(data, separators=(",", ":")),
+                headers={"Content-Type": "application/json", "Accept-Encoding": "identity"},
+                timeout=5,
+            )
             results.append(r.json())
 
         if wait:
@@ -240,7 +275,12 @@ class ESP32RobotSkill:
         data = {"motor": motor, "steps": steps, "accel": accel}
         if speed:
             data["speed"] = speed
-        r = requests.post(f"{self.api}/motor/relative", json=data, timeout=5)
+        r = requests.post(
+            f"{self.api}/motor/relative",
+            data=json.dumps(data, separators=(",", ":")),
+            headers={"Content-Type": "application/json", "Accept-Encoding": "identity"},
+            timeout=5,
+        )
         return r.json()
 
     def center(self) -> dict:
@@ -280,7 +320,12 @@ class ESP32RobotSkill:
         Args:
             motor: "pan"/"tilt"/"all"
         """
-        r = requests.post(f"{self.api}/motor/stop", json={"motor": motor}, timeout=5)
+        r = requests.post(
+            f"{self.api}/motor/stop",
+            data=json.dumps({"motor": motor}, separators=(",", ":")),
+            headers={"Content-Type": "application/json", "Accept-Encoding": "identity"},
+            timeout=5,
+        )
         return r.json()
 
     def wait_for_idle(self, timeout_ms: int = 10000) -> bool:
@@ -309,17 +354,22 @@ class ESP32RobotSkill:
 
     # ========== 摄像头 ==========
 
-    def capture(self, save_path: str = None) -> dict:
+    def capture(self, save_path: str = None, warmup: float = 5.0) -> dict:
         """
         拍照
 
         Args:
             save_path: 可选保存路径
+            warmup: 等待摄像头稳定的时间(秒)，默认5秒
 
         Returns:
             {"ok": True, "size": bytes大小} 或 {"error": "message"}
         """
         try:
+            # 拍照前关闭LED1避免光污染，等待摄像头自动曝光稳定
+            self.set_led(effect="off", target=1)
+            if warmup > 0:
+                time.sleep(warmup)
             r = requests.get(f"{self.api}/camera/capture", timeout=10)
             if r.status_code == 200:
                 data = r.content
@@ -334,8 +384,12 @@ class ESP32RobotSkill:
 
     def enable_camera(self, enabled: bool = True) -> dict:
         """开关摄像头"""
-        r = requests.post(f"{self.api}/camera/config",
-                         json={"enabled": enabled}, timeout=5)
+        r = requests.post(
+            f"{self.api}/camera/config",
+            data=json.dumps({"enabled": enabled}, separators=(",", ":")),
+            headers={"Content-Type": "application/json", "Accept-Encoding": "identity"},
+            timeout=5,
+        )
         return r.json()
 
     # ========== 音频 ==========
@@ -427,11 +481,10 @@ if __name__ == "__main__":
     parser.add_argument("args", nargs="*", help="Command arguments")
     parser.add_argument("--host", default="192.168.31.220", help="Robot host IP")
 
-    args = parser.parse_args(sys.argv[1:2])
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    cmd_args = sys.argv[2:]
+    args = parser.parse_args([cmd])
     robot = ESP32RobotSkill(args.host)
-
-    cmd = args.command
-    cmd_args = args.args
 
     try:
         if cmd == "emotion":
@@ -507,7 +560,7 @@ if __name__ == "__main__":
         elif cmd == "capture":
             parser2 = argparse.ArgumentParser()
             parser2.add_argument("--save")
-            ns = parser2.parse_args(cmd_args[1:] if len(cmd_args) > 1 else [])
+            ns = parser2.parse_args(cmd_args if cmd_args else [])
             result = robot.capture(save_path=ns.save)
             print(result)
 
