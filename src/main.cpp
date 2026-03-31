@@ -2,6 +2,7 @@
 #include <esp_camera.h>
 #include <esp_http_server.h>
 #include <esp_system.h>
+#include <esp_sleep.h>
 #include <WiFi.h>
 #include <Wire.h>
 #include <Adafruit_NeoPixel.h>
@@ -10,6 +11,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
+#include <time.h>
+#include <sys/time.h>
 #include "audio.h"
 
 // ========== WiFi 配置 ==========
@@ -74,6 +77,128 @@ int led_animation_step[2] = {0, 0};
 bool camera_enabled = false;
 unsigned long boot_time = 0;
 httpd_handle_t httpServer = NULL;
+bool self_check_passed = false;  // 启动自检是否通过
+bool sleep_scheduled = true;     // 是否启用定时休眠 (2:00-8:00)
+bool boot_in_progress = true;    // 启动中，禁止ledTask控制LED
+
+// ========== RTC 内存 (Deep Sleep保留) ==========
+RTC_NOINIT_ATTR unsigned long rtc_boot_millis;  // 上次重启时的millis
+RTC_NOINIT_ATTR time_t rtc_last_ntp_time;       // 上次NTP同步的时间戳
+RTC_NOINIT_ATTR bool rtc_time_synced;           // NTP是否已同步
+
+// 前向声明
+void setLedColor(int idx, uint32_t color);
+
+// ========== NTP 时间同步 ==========
+bool ntp_actually_synced = false;
+
+void syncNTPTime() {
+    if (rtc_time_synced && rtc_last_ntp_time > 0) {
+        // 恢复之前的时间并加上经过的时间
+        unsigned long elapsed = millis() - rtc_boot_millis;
+        time_t current_time = rtc_last_ntp_time + (elapsed / 1000);
+        struct timeval tv = {current_time, 0};
+        settimeofday(&tv, NULL);
+        ntp_actually_synced = true;
+        Serial.printf("[NTP] Restored time from RTC: %s", ctime(&current_time));
+        return;
+    }
+
+    Serial.println("[NTP] Syncing time...");
+    configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");  // UTC+8 中国时区
+
+    // 等待NTP同步，最多等待3秒
+    delay(3000);
+
+    struct timeval tv;
+    if (gettimeofday(&tv, NULL) == 0 && tv.tv_sec > 1000000000) {
+        // tv_sec > 1000000000 表示时间有效（2001年后）
+        rtc_last_ntp_time = tv.tv_sec;
+        rtc_boot_millis = millis();
+        rtc_time_synced = true;
+        ntp_actually_synced = true;
+        Serial.printf("[NTP] Time synced: %s", ctime(&tv.tv_sec));
+    } else {
+        Serial.println("[NTP] Failed to sync time (NTP unavailable or time invalid)");
+        ntp_actually_synced = false;
+    }
+}
+
+// 检查是否应该进入休眠 (2:00-8:00)
+bool shouldSleep() {
+    if (!sleep_scheduled) return false;
+    if (!ntp_actually_synced) return false;  // NTP未同步时不休眠
+
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+
+    int hour = timeinfo.tm_hour;
+    // 2:00-8:00 进入休眠
+    return (hour >= 2 && hour < 8);
+}
+
+// 进入深度睡眠
+void enterSleep() {
+    Serial.println("[SLEEP] Entering deep sleep until 8:00...");
+
+    // 关闭所有LED
+    setLedColor(0, 0x000000);
+    setLedColor(1, 0x000000);
+
+    // 关闭摄像头
+    if (camera_enabled) {
+        camera_enabled = false;
+        pinMode(CAM_PWDN, OUTPUT);
+        digitalWrite(CAM_PWDN, HIGH);
+    }
+
+    // 关闭WiFi
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+
+    // 显示休眠状态
+    Wire.end();
+    Wire.begin(1, 2);
+    display.clearDisplay();
+    display.setRotation(oled_rotation);
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(20, 20);
+    display.print("Sleep");
+    display.display();
+
+    delay(1000);
+
+    // 计算到8:00的微秒数
+    time_t now;
+    time(&now);
+    struct tm timeinfo;
+    localtime_r(&now, &timeinfo);
+    timeinfo.tm_hour = 8;
+    timeinfo.tm_min = 0;
+    timeinfo.tm_sec = 0;
+    time_t wake_time = mktime(&timeinfo);
+
+    if (wake_time <= now) {
+        wake_time += 86400;  // 加一天
+    }
+
+    unsigned long long sleep_us = (unsigned long long)(wake_time - now) * 1000000ULL;
+
+    Serial.printf("[SLEEP] Sleeping for %llu seconds...\n", (wake_time - now));
+
+    // 保存当前状态到RTC
+    rtc_boot_millis = millis();
+    time_t current_time;
+    gettimeofday(NULL, NULL);
+    time(&current_time);
+    rtc_last_ntp_time = current_time;
+    rtc_time_synced = true;
+
+    esp_deep_sleep_start();
+}
 
 // ========== 电机命令队列 ==========
 struct MotorCommand {
@@ -110,8 +235,8 @@ struct LedGroup {
 };
 
 LedGroup leds[2] = {
-    {"static", 0xFF0000, 50, 100},
-    {"static", 0x00FF00, 50, 100}
+    {"off", 0x000000, 50, 100},
+    {"off", 0x000000, 50, 100}
 };
 
 // ========== 函数声明 ==========
@@ -299,6 +424,9 @@ uint32_t applyBrightness(uint32_t color, int brightness) {
 }
 
 void ledUpdate() {
+    // 启动过程中不允许LED任务控制LED（防止覆盖启动动画）
+    if (boot_in_progress) return;
+
     unsigned long now = millis();
     static bool lowBatteryWarn = false;  // 保持状态，避免抖动
     static int warnEnterPct = 0;  // 进入警告时的电量
@@ -469,46 +597,68 @@ float readBatteryVoltage() {
     }
     float raw_avg = sum / samples;
     // ESP32-S3 ADC: 12位 (0-4095), 参考电压 3.3V
-    // 分压电阻: VBAT --[R1]--+--[R2]-- GND
-    // 实际使用中分压比可能不是严格的 2:1，需要校准
+    // 分压电阻: VBAT --[R1]--+--[R2]-- GND (100k + 100k)
+    // 校准: 实际测量4.03V时系统显示3.85V, 所以实际分压比约为 2.09
     float v_adc = raw_avg / 4095.0 * 3.3;
-    return v_adc * 2.0;  // 假设分压比 2:1
+    return v_adc * 2.09;  // 实际分压比 2.09:1
 }
 
-// 3.7V LiPo 电池电压曲线（近似）：
-// 4.2V = 100%, 3.7V = ~60%, 3.5V = ~40%, 3.0V = ~5%, 3.3V = 20%
+// 3.7V LiPo 电池电压曲线（根据实际电池校准）：
+// 4.03V = 100% (满电)
+// 3.7V = ~60%, 3.5V = ~40%, 3.0V = ~5%, 3.3V = 20%
 int voltageToPercent(float v) {
-    if (v >= 4.2) return 100;
-    if (v <= 3.0) return 0;
-    if (v <= 3.3) return (int)((v - 3.0) / 0.3 * 20);  // 3.0-3.3V: 0-20%
-    if (v <= 3.7) return (int)(20 + (v - 3.3) / 0.4 * 40);  // 3.3-3.7V: 20-60%
-    return (int)(60 + (v - 3.7) / 0.5 * 40);  // 3.7-4.2V: 60-100%
+    // 限制最大电压，避免充电时电压被拉高导致误判100%
+    if (v > 4.03f) v = 4.03f;
+    if (v >= 4.03f) return 100;
+    if (v <= 3.0f) return 0;
+    if (v <= 3.3f) return (int)((v - 3.0f) / 0.3f * 20.f);  // 3.0-3.3V: 0-20%
+    if (v <= 3.7f) return (int)(20.f + (v - 3.3f) / 0.4f * 40.f);  // 3.3-3.7V: 20-60%
+    return (int)(60.f + (v - 3.7f) / 0.33f * 40.f);  // 3.7-4.03V: 60-100%
 }
 
 bool isCharging() {
-    // 充电检测需要稳定的电平，添加去抖
+    // 充电检测：
+    // - 充电时USB_CHG为LOW（充电指示灯红色）
+    // - 充满后USB_CHG为HIGH（充电指示灯绿色/熄灭）
+    // - 需要去抖避免抖动
     static unsigned long last_change = 0;
-    static int last_state = -1;
-    static int stable_count = 0;
+    static int debounced_state = -1;  // -1=未初始化, 0=LOW, 1=HIGH
+    static int consecutive_count = 0;
 
     int current = digitalRead(USB_CHG);
     unsigned long now = millis();
 
-    if (current != last_state) {
+    if (current != debounced_state) {
+        // 状态变化，重置计数器
         last_change = now;
-        last_state = current;
-        stable_count = 0;
-        return last_state == HIGH;  // 返回上一次稳定状态
-    }
-
-    // 消抖 100ms
-    if (now - last_change > 100) {
-        stable_count++;
-        if (stable_count > 5) {  // 连续5次稳定才确认状态
-            return current == HIGH;
+        consecutive_count = 0;
+        debounced_state = current;
+    } else {
+        // 状态稳定，累加计数
+        if (now - last_change > 50) {  // 50ms消抖
+            consecutive_count++;
         }
     }
-    return last_state == HIGH;
+
+    // 确认状态稳定（连续5次以上相同）
+    if (consecutive_count < 5) {
+        // 返回最近确认的状态（未完全稳定时保持之前状态）
+        static int confirmed_state = -1;
+        if (confirmed_state == -1) confirmed_state = (debounced_state == 0) ? 0 : 1;
+        return confirmed_state == 0;
+    }
+
+    // 状态已稳定
+    bool pin_charging = (debounced_state == 0);  // LOW表示充电中
+
+    // 双重检测：如果电压>=4.0V，认为已充满，不再是充电状态
+    float v = readBatteryVoltage();
+    if (v >= 4.00f) {
+        // 电压已满（涓流充电阶段），充电结束
+        return false;
+    }
+
+    return pin_charging;
 }
 
 // ========== Monitor Task ==========
@@ -961,6 +1111,7 @@ static esp_err_t ledStatusHandler(httpd_req_t* req) {
 
 // POST /api/v1/oled/text - Display text
 // Body: {"text":"Hello","x":0,"y":0,"size":1} or {"text":"Line1","line":0,"size":2}
+// Special: {"text":"battery"} shows battery status with charging indicator
 static esp_err_t oledTextHandler(httpd_req_t* req) {
     char buf[512];
     int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
@@ -988,6 +1139,39 @@ static esp_err_t oledTextHandler(httpd_req_t* req) {
     display.setRotation(oled_rotation);
     display.setTextSize(size);
     display.setTextColor(SSD1306_WHITE);
+
+    // Special "battery" command shows battery status with charging indicator
+    if (strcmp(text, "battery") == 0) {
+        float v = readBatteryVoltage();
+        int pct = voltageToPercent(v);
+        bool charging = isCharging();
+
+        // Show percentage on line 0
+        display.setCursor(0, 0);
+        if (charging) {
+            display.print("+");  // Charging indicator
+        }
+        display.print(pct);
+        display.print("%");
+        display.print(" ");
+        display.print(v, 2);
+        display.print("V");
+
+        // Show "Charging" text on line 1 if charging
+        if (charging) {
+            display.setTextSize(1);
+            display.setCursor(0, 8);
+            display.print("Charging");
+        }
+        display.display();
+
+        char resp[256];
+        snprintf(resp, sizeof(resp), "{\"ok\":true,\"battery\":{\"voltage\":%.2f,\"percent\":%d,\"charging\":%s}}",
+            v, pct, charging ? "true" : "false");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, resp, strlen(resp));
+        return ESP_OK;
+    }
 
     if (line >= 0) {
         y = line * 8 * size;
@@ -1407,6 +1591,15 @@ void initWiFi() {
         Serial.print(".");
     }
     Serial.printf("\n[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
+
+    // NTP时间同步
+    syncNTPTime();
+
+    // 检查是否应该休眠
+    if (shouldSleep()) {
+        enterSleep();
+        // 不会执行到这里
+    }
 }
 
 // ========== Setup ==========
@@ -1449,15 +1642,22 @@ void setup() {
     }
 
     initLED();
-    setLedColor(0, 0xFF0000);
-    setLedColor(1, 0x00FF00);
-    delay(500);
+    // 启动时：LED0红色闪烁表示正在启动
+    Serial.println("[BOOT] Initializing...");
+    for (int i = 0; i < 6; i++) {
+        setLedColor(0, 0xFF0000);  // LED0 红色
+        setLedColor(1, 0x000000);  // LED1 关闭
+        delay(200);
+        setLedColor(0, 0x000000);
+        delay(200);
+        Serial.printf("[BOOT] %d/6...\n", i+1);
+    }
 
     initBattery();
-    delay(500);
+    delay(200);
 
     initWiFi();
-    delay(500);
+    delay(200);
 
     motorQueue = xQueueCreateStatic(8, sizeof(MotorCommand), motorQueueBuffer, &motorQueueStruct);
     ledQueue = xQueueCreateStatic(8, sizeof(LedCommand), ledQueueBuffer, &ledQueueStruct);
@@ -1465,6 +1665,18 @@ void setup() {
     xTaskCreatePinnedToCore(motorTask, "motor", 4096, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(ledTask, "led", 4096, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(monitorTask, "monitor", 4096, NULL, 1, NULL, 1);
+
+    // 自检通过：绿色5秒
+    Serial.println("[BOOT] Self-check passed!");
+    setLedColor(0, 0x00FF00);  // LED0 绿色
+    setLedColor(1, 0x00FF00);  // LED1 绿色
+    delay(5000);
+
+    // 关闭所有LED
+    setLedColor(0, 0x000000);
+    setLedColor(1, 0x000000);
+    self_check_passed = true;
+    boot_in_progress = false;  // 允许LED任务接管
 
     startWebServer();
 
@@ -1476,6 +1688,52 @@ void setup() {
     Serial.printf("System status: /api/v1/status\n");
 }
 
+// 充电时更新OLED显示
+void updateChargingDisplay() {
+    static bool last_charging = false;
+    bool charging = isCharging();
+
+    // 充电状态改变时更新显示
+    if (charging != last_charging) {
+        last_charging = charging;
+
+        Wire.end();
+        Wire.begin(1, 2);
+        display.clearDisplay();
+        display.setRotation(oled_rotation);
+
+        if (charging) {
+            // 充电中：显示电池状态
+            float v = readBatteryVoltage();
+            int pct = voltageToPercent(v);
+            display.setTextSize(2);
+            display.setTextColor(SSD1306_WHITE);
+            display.setCursor(0, 0);
+            display.print("+");
+            display.print(pct);
+            display.print("%");
+            display.setTextSize(1);
+            display.setCursor(0, 16);
+            display.printf("%.2fV", v);
+            display.setCursor(0, 28);
+            display.print("Charging");
+            Serial.printf("[OLED] Charging: %d%% %.2fV\n", pct, v);
+        }
+        // 不充电：清除显示（不显示任何内容）
+
+        display.display();
+    }
+}
+
 void loop() {
+    // 检查是否应该进入休眠
+    if (shouldSleep()) {
+        enterSleep();
+        // 不会执行到这里
+    }
+
+    // 充电时自动更新OLED显示
+    updateChargingDisplay();
+
     vTaskDelay(1000 / portTICK_PERIOD_MS);
 }
