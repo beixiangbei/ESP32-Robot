@@ -4,7 +4,7 @@ description: "ESP32-S3 桌面机器人控制 - 显示表情、控制LED、云台
 compatibility: "Portable Agent Skills format. Requires Python 3.8+ with requests library."
 metadata:
   {
-    "version": "1.0.0",
+    "version": "1.1.0",
     "category": "hardware",
     "author": "beixiangbei",
     "openclaw":
@@ -22,11 +22,13 @@ metadata:
 ## 设备配置
 
 - **IP地址**: 192.168.31.220
+- **固件版本**: v1.1.0
 - **屏幕**: 128x64 OLED, rotation=3 (270°)
 - **LED**: 5颗 WS2812 (3+2)
 - **云台**: 双轴步进电机 (pan/tilt)
 - **摄像头**: OV5640 JPEG
 - **音频**: 扬声器 + 麦克风
+- **电池**: 3.7V LiPo, 满电4.03V, 分压比2.09
 
 ## 表情系统
 
@@ -128,6 +130,7 @@ python3 esp32_robot_skill.py listen  # 返回环境音量 0-255
 ```bash
 python3 esp32_robot_skill.py status   # 完整状态
 python3 esp32_robot_skill.py battery  # 电池状态
+python3 esp32_robot_skill.py battery-display  # OLED显示电池状态
 python3 esp32_robot_skill.py ping      # 检查在线
 python3 esp32_robot_skill.py reboot   # 重启设备
 ```
@@ -160,6 +163,7 @@ level = robot.listen_level()
 # 系统
 status = robot.get_status()
 battery = robot.get_battery()
+robot.show_battery_display()  # 充电时OLED显示电池状态
 ```
 
 ## 安装依赖
@@ -174,3 +178,6 @@ pip install requests
 2. 电池电压 < 15% 时LED会低电量闪烁警告
 3. 摄像头和OLED共享I2C总线，同时开启会自动处理冲突
 4. 云台移动完成后 busy=false，可通过 wait_for_idle() 等待
+5. 定时休眠：每天 2:00-8:00 自动进入深度睡眠，关闭WiFi和摄像头
+6. 充电时OLED会自动显示电量百分比、电压和充电状态
+7. 电池校准：满电4.03V，电压计算已根据实际测量校准分压比

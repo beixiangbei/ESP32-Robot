@@ -434,6 +434,32 @@ class ESP32RobotSkill:
         status = self.get_status()
         return status.get("battery", {})
 
+    def show_battery_display(self) -> dict:
+        """
+        在OLED上显示电池状态（百分比、电压、充电指示）
+
+        Returns:
+            {"ok": True, "battery": {"voltage": 4.12, "percent": 100, "charging": true}}
+        """
+        try:
+            r = requests.post(
+                f"{self.api}/oled/text",
+                data=json.dumps({"text": "battery"}, separators=(",", ":")),
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept-Encoding": "identity",
+                },
+                timeout=5,
+            )
+            if r.status_code == 200:
+                try:
+                    return json.loads(r.text)
+                except Exception:
+                    return r.json()
+            return {"error": f"HTTP {r.status_code}"}
+        except Exception as e:
+            return {"error": str(e)}
+
     def ping(self) -> bool:
         """检查设备在线"""
         try:
@@ -583,6 +609,10 @@ if __name__ == "__main__":
 
         elif cmd == "battery":
             result = robot.get_battery()
+            print(result if isinstance(result, str) else str(result))
+
+        elif cmd == "battery-display":
+            result = robot.show_battery_display()
             print(result if isinstance(result, str) else str(result))
 
         elif cmd == "ping":
