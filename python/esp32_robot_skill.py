@@ -3,10 +3,20 @@
 ESP32-Robot Skill - AI Agent 具身交互控制库
 
 用于控制 ESP32-S3 桌面机器人，通过 HTTP API 实现表情、LED、云台、摄像头等功能
+
+用法:
+    python3 esp32_robot_skill.py <command> [args...]
+
+示例:
+    python3 esp32_robot_skill.py emotion happy
+    python3 esp32_robot_skill.py led rainbow --brightness 50
+    python3 esp32_robot_skill.py look --pan 500 --tilt 300
 """
 
 import requests
 import time
+import sys
+import argparse
 from typing import Optional
 
 
@@ -359,8 +369,11 @@ class ESP32RobotSkill:
 
     def get_status(self) -> dict:
         """获取完整系统状态"""
-        r = requests.get(f"{self.api}/status", timeout=5)
-        return r.json()
+        try:
+            r = requests.get(f"{self.api}/status", timeout=5)
+            return r.json()
+        except:
+            return {"error": "failed to get status"}
 
     def get_battery(self) -> dict:
         """获取电池状态"""
@@ -409,30 +422,138 @@ class ESP32RobotSkill:
 # ========== 独立测试 ==========
 
 if __name__ == "__main__":
-    robot = ESP32RobotSkill("192.168.31.220")
+    parser = argparse.ArgumentParser(description="ESP32-Robot Skill CLI")
+    parser.add_argument("command", help="Command to execute")
+    parser.add_argument("args", nargs="*", help="Command arguments")
+    parser.add_argument("--host", default="192.168.31.220", help="Robot host IP")
 
-    print("=== ESP32-Robot Skill Test ===")
-    print(f"Ping: {robot.ping()}")
-    print(f"Status: {robot.get_status()}")
-    print(f"Battery: {robot.get_battery()}")
+    args = parser.parse_args(sys.argv[1:2])
+    robot = ESP32RobotSkill(args.host)
 
-    print("\n=== Test Emotions ===")
-    emotions = ["happy", "sad", "angry", "think", "love", "loading"]
-    for e in emotions:
-        print(f"Emotion: {e}")
-        robot.show_emotion(e)
-        time.sleep(1)
+    cmd = args.command
+    cmd_args = args.args
 
-    print("\n=== Test LED ===")
-    robot.set_led("rainbow", brightness=50)
+    try:
+        if cmd == "emotion":
+            emotion = cmd_args[0] if cmd_args else "happy"
+            result = robot.show_emotion(emotion)
+            print(result)
 
-    print("\n=== Test Camera ===")
-    result = robot.capture()
-    print(f"Capture: {result}")
+        elif cmd == "text":
+            text = cmd_args[0] if cmd_args else ""
+            parser2 = argparse.ArgumentParser()
+            parser2.add_argument("--line", type=int)
+            parser2.add_argument("--size", type=int)
+            parser2.add_argument("--x", type=int)
+            parser2.add_argument("--y", type=int)
+            ns = parser2.parse_args(cmd_args[1:] if len(cmd_args) > 1 else [])
+            kwargs = {}
+            if ns.line is not None: kwargs["line"] = ns.line
+            if ns.size is not None: kwargs["size"] = ns.size
+            if ns.x is not None: kwargs["x"] = ns.x
+            if ns.y is not None: kwargs["y"] = ns.y
+            result = robot.show_text(text, **kwargs)
+            print(result)
 
-    print("\n=== Test Audio ===")
-    print(f"Listen level: {robot.listen_level()}")
-    robot.beep()
+        elif cmd == "led":
+            effect = cmd_args[0] if cmd_args else "static"
+            parser2 = argparse.ArgumentParser()
+            parser2.add_argument("--color", default="FFFFFF")
+            parser2.add_argument("--brightness", type=int)
+            parser2.add_argument("--speed", type=int)
+            parser2.add_argument("--target", type=int, default=-1)
+            ns = parser2.parse_args(cmd_args[1:] if len(cmd_args) > 1 else [])
+            kwargs = {}
+            if ns.brightness is not None: kwargs["brightness"] = ns.brightness
+            if ns.speed is not None: kwargs["speed"] = ns.speed
+            if ns.target is not None: kwargs["target"] = ns.target
+            result = robot.set_led(effect, color=ns.color, **kwargs)
+            print(result)
 
-    print("\n=== Done ===")
-    robot.clear_display()
+        elif cmd == "look":
+            parser2 = argparse.ArgumentParser()
+            parser2.add_argument("--pan", type=int)
+            parser2.add_argument("--tilt", type=int)
+            parser2.add_argument("--speed", type=int)
+            ns = parser2.parse_args(cmd_args)
+            kwargs = {}
+            if ns.speed is not None: kwargs["speed"] = ns.speed
+            if ns.pan is not None and ns.tilt is not None:
+                result = robot.look_at(pan=ns.pan, tilt=ns.tilt, **kwargs)
+            elif ns.pan is not None:
+                result = robot.look_at(pan=ns.pan, **kwargs)
+            elif ns.tilt is not None:
+                result = robot.look_at(tilt=ns.tilt, **kwargs)
+            else:
+                print("Error: --pan or --tilt required")
+                sys.exit(1)
+            print(result)
+
+        elif cmd == "center":
+            print(robot.center())
+
+        elif cmd == "look-around":
+            parser2 = argparse.ArgumentParser()
+            parser2.add_argument("--style", default="slow")
+            parser2.add_argument("--rounds", type=int, default=1)
+            ns = parser2.parse_args(cmd_args[1:] if len(cmd_args) > 1 else [])
+            result = robot.look_around(style=ns.style, rounds=ns.rounds)
+            print(result)
+
+        elif cmd == "stop":
+            motor = cmd_args[0] if cmd_args else "all"
+            print(robot.stop_motor(motor))
+
+        elif cmd == "capture":
+            parser2 = argparse.ArgumentParser()
+            parser2.add_argument("--save")
+            ns = parser2.parse_args(cmd_args[1:] if len(cmd_args) > 1 else [])
+            result = robot.capture(save_path=ns.save)
+            print(result)
+
+        elif cmd == "camera":
+            enabled = cmd_args[0] == "on" if cmd_args else True
+            print(robot.enable_camera(enabled))
+
+        elif cmd == "beep":
+            parser2 = argparse.ArgumentParser()
+            parser2.add_argument("--type", default="ok")
+            ns = parser2.parse_args(cmd_args[1:] if len(cmd_args) > 1 else [])
+            print(robot.beep(type=ns.type))
+
+        elif cmd == "listen":
+            print(robot.listen_level())
+
+        elif cmd == "status":
+            result = robot.get_status()
+            print(result if isinstance(result, str) else str(result))
+
+        elif cmd == "battery":
+            result = robot.get_battery()
+            print(result if isinstance(result, str) else str(result))
+
+        elif cmd == "ping":
+            print({"online": robot.ping()})
+
+        elif cmd == "reboot":
+            print(robot.reboot())
+
+        elif cmd == "clear":
+            print(robot.clear_display())
+
+        elif cmd == "wake-up":
+            robot.wake_up()
+            print({"ok": True, "action": "wake-up"})
+
+        elif cmd == "sleep":
+            robot.sleep()
+            print({"ok": True, "action": "sleep"})
+
+        else:
+            print(f"Unknown command: {cmd}")
+            print("Available commands: emotion, text, led, look, center, look-around, stop, capture, camera, beep, listen, status, battery, ping, reboot, clear, wake-up, sleep")
+            sys.exit(1)
+
+    except Exception as e:
+        print({"error": str(e)})
+        sys.exit(1)
