@@ -5,7 +5,10 @@ ARG PLATFORMIO_VERSION=6.1.18
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PLATFORMIO_CORE_DIR=/root/.platformio
 
-RUN python -m pip install --no-cache-dir "platformio==${PLATFORMIO_VERSION}"
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends g++ \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m pip install --no-cache-dir "platformio==${PLATFORMIO_VERSION}"
 
 WORKDIR /workspace
 

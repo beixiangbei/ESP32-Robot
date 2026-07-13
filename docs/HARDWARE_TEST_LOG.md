@@ -52,6 +52,20 @@ Motor cancellation checks:
 6. Compare battery current while moving and for two minutes after completion. The
    post-movement current must return to the non-motor idle baseline.
 
+Soft-limit and calibration checks:
+
+1. Manually position both axes at the intended center and call `motor/calibrate`.
+2. Move toward each physical boundary in small increments and record the last safe
+   logical position; do not use the development defaults as a physical target.
+3. Verify commands one step inside each measured boundary are accepted and commands
+   one step outside are rejected without movement.
+4. Reboot and confirm the UI/API clearly treats the restored position as estimated.
+5. Determine whether pan or tilt direction must be reversed in configuration.
+6. Open the root control page from a real phone and verify both axis panels fit
+   without horizontal scrolling at the browser's default zoom.
+7. Save limits and direction, reboot the ESP32, and confirm the same values load
+   from NVS.
+
 Acceptance evidence:
 
 - Raw measurements entered in the matrix.

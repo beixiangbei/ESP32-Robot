@@ -27,6 +27,12 @@ Additional arguments are passed to `pio run`. For example, a verbose build is:
 .\scripts\firmware-build.ps1 -v
 ```
 
+Run host-side tests for hardware-independent policy code with:
+
+```powershell
+.\scripts\host-test.ps1
+```
+
 ## Outputs
 
 PlatformIO writes build output under:

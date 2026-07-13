@@ -14,6 +14,9 @@
 #include <time.h>
 #include <sys/time.h>
 #include "audio.h"
+#include "control_panel.h"
+#include "motor_config.h"
+#include "motor_policy.h"
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -82,6 +85,7 @@ volatile uint8_t motorState = 0;
 const uint8_t phaseSequence[8] = {0x08, 0x0C, 0x04, 0x06, 0x02, 0x03, 0x01, 0x09};
 volatile int motor1Seq = 0, motor2Seq = 4;
 volatile uint32_t motorCancelGeneration[2] = {0, 0};
+volatile bool motorRunning[2] = {false, false};
 portMUX_TYPE motorStateMux = portMUX_INITIALIZER_UNLOCKED;
 
 Adafruit_NeoPixel strip0(LED_COUNT_0, LED_PIN_0, NEO_GRB + NEO_KHZ800);
@@ -223,6 +227,7 @@ struct MotorCommand {
     int motor_idx;      // 0=pan, 1=tilt
     int steps;          // 相对步数 (0表示用target)
     int target;         // 绝对目标位置 (-1表示用steps)
+    bool absolute;
     int speed;
     bool accel;
     uint32_t cancel_generation;
@@ -295,12 +300,13 @@ void updateMotorState() {
 
 // ========== 单步电机 ==========
 void stepMotor(int motor_idx, int dir) {
+    int physical_dir = motorPhysicalDirection(motorAxisConfigs[motor_idx], dir);
     portENTER_CRITICAL(&motorStateMux);
     if (motor_idx == 0) {
-        motor1Seq = (motor1Seq + dir + 8) % 8;
+        motor1Seq = (motor1Seq + physical_dir + 8) % 8;
         motorState = (motorState & 0xF0) | (phaseSequence[motor1Seq] & 0x0F);
     } else {
-        motor2Seq = (motor2Seq + dir + 8) % 8;
+        motor2Seq = (motor2Seq + physical_dir + 8) % 8;
         motorState = (motorState & 0x0F) | ((phaseSequence[motor2Seq] & 0x0F) << 4);
     }
     updateMotorState();
@@ -349,21 +355,28 @@ void motorTask(void* param) {
                 continue;
             }
 
-            if (cmd.target >= 0) {
-                int diff = cmd.target - motors[motor_idx].pos;
-                if (diff == 0) {
-                    motors[motor_idx].busy = false;
-                    releaseMotor(motor_idx);
-                    continue;
-                }
-                dir = diff > 0 ? 1 : -1;
-                steps_to_move = abs(diff);
-            } else {
-                dir = cmd.steps > 0 ? 1 : -1;
-                steps_to_move = abs(cmd.steps);
+            MotorMoveResult move = cmd.absolute
+                ? validateAbsoluteMove(motorAxisConfigs, 2, motor_idx, cmd.target)
+                : validateRelativeMove(motorAxisConfigs, 2, motor_idx,
+                                       motors[motor_idx].pos, cmd.steps);
+            if (!move.accepted()) {
+                Serial.printf("[MOTOR] rejected queued command: motor=%d error=%s\n",
+                              motor_idx, motorMoveErrorMessage(move.error));
+                releaseMotor(motor_idx);
+                continue;
             }
 
+            int diff = move.target_position - motors[motor_idx].pos;
+            if (diff == 0) {
+                motors[motor_idx].busy = false;
+                releaseMotor(motor_idx);
+                continue;
+            }
+            dir = diff > 0 ? 1 : -1;
+            steps_to_move = abs(diff);
+
             motors[motor_idx].busy = true;
+            motorRunning[motor_idx] = true;
             motors[motor_idx].speed = cmd.speed;
             motors[motor_idx].target_pos = motors[motor_idx].pos + (dir * steps_to_move);
 
@@ -378,6 +391,7 @@ void motorTask(void* param) {
             }
 
             motors[motor_idx].busy = false;
+            motorRunning[motor_idx] = false;
             motors[motor_idx].target_pos = motors[motor_idx].pos;
             releaseMotor(motor_idx);
         }
@@ -387,19 +401,35 @@ void motorTask(void* param) {
 void stopMotor(int motor_idx) {
     if (motor_idx == 0 || motor_idx == 1) {
         motorCancelGeneration[motor_idx]++;
-        motors[motor_idx].busy = false;
-        motors[motor_idx].target_pos = motors[motor_idx].pos;
         releaseMotor(motor_idx);
-        Serial.printf("[MOTOR] %d stopped at pos=%d\n", motor_idx, motors[motor_idx].pos);
+        Serial.printf("[MOTOR] stop requested for %d at pos=%d\n",
+                      motor_idx, motors[motor_idx].pos);
     } else {
         motorCancelGeneration[0]++;
         motorCancelGeneration[1]++;
-        motors[0].busy = false;
-        motors[1].busy = false;
-        motors[0].target_pos = motors[0].pos;
-        motors[1].target_pos = motors[1].pos;
         releaseMotor(-1);
-        Serial.println("[MOTOR] all stopped");
+        Serial.println("[MOTOR] stop requested for all motors");
+    }
+}
+
+bool calibrateMotor(int motor_idx) {
+    if (motor_idx == 0 || motor_idx == 1) {
+        stopMotor(motor_idx);
+        unsigned long started = millis();
+        while (motorRunning[motor_idx] && millis() - started < 1000) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (motorRunning[motor_idx]) {
+            Serial.printf("[MOTOR] calibration timed out for %d\n", motor_idx);
+            return false;
+        }
+        motors[motor_idx].pos = motorAxisConfigs[motor_idx].center_position;
+        motors[motor_idx].target_pos = motors[motor_idx].pos;
+        Serial.printf("[MOTOR] %d calibrated at center=%d\n",
+                      motor_idx, motors[motor_idx].pos);
+        return true;
+    } else {
+        return calibrateMotor(0) && calibrateMotor(1);
     }
 }
 
@@ -809,7 +839,7 @@ const char* jsonGetStr(const char* buf, const char* key, char* out, size_t maxle
 
 // POST /api/v1/motor/relative
 static esp_err_t motorRelativeHandler(httpd_req_t* req) {
-    MotorCommand cmd = {0, 0, -1, 10, true, 0};
+    MotorCommand cmd = {0, 0, 0, false, 10, true, 0};
 
     char buf[256];
     if (req->method == HTTP_GET) {
@@ -835,6 +865,18 @@ static esp_err_t motorRelativeHandler(httpd_req_t* req) {
         return ESP_FAIL;
     }
 
+    MotorMoveResult move = validateRelativeMove(
+        motorAxisConfigs, 2, cmd.motor_idx, motors[cmd.motor_idx].pos, cmd.steps);
+    if (!move.accepted()) {
+        char error_resp[128];
+        snprintf(error_resp, sizeof(error_resp), "{\"error\":\"%s\"}",
+                 motorMoveErrorMessage(move.error));
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, error_resp);
+        return ESP_FAIL;
+    }
+
     cmd.speed = constrain(cmd.speed, 1, 100);
     cmd.cancel_generation = motorCancelGeneration[cmd.motor_idx];
     if (xQueueSend(motorQueue, &cmd, 0) != pdTRUE) {
@@ -854,12 +896,12 @@ static esp_err_t motorRelativeHandler(httpd_req_t* req) {
 
 // POST /api/v1/motor/absolute
 static esp_err_t motorAbsoluteHandler(httpd_req_t* req) {
-    MotorCommand cmd = {0, 0, -1, 10, true, 0};
+    MotorCommand cmd = {0, 0, INT32_MIN, true, 10, true, 0};
 
     char buf[256];
     if (req->method == HTTP_GET) {
         cmd.motor_idx = getQueryParamInt(req, "motor", 0);
-        cmd.target = getQueryParamInt(req, "target", -1);
+        cmd.target = getQueryParamInt(req, "target", INT32_MIN);
         cmd.speed = getQueryParamInt(req, "speed", 10);
     } else {
         int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
@@ -867,7 +909,7 @@ static esp_err_t motorAbsoluteHandler(httpd_req_t* req) {
         buf[len] = 0;
 
         cmd.motor_idx = jsonGetInt(buf, "motor", 0);
-        cmd.target = jsonGetInt(buf, "target", -1);
+        cmd.target = jsonGetInt(buf, "target", INT32_MIN);
         cmd.speed = jsonGetInt(buf, "speed", 10);
 
         if (cmd.speed <= 0) cmd.speed = 10;
@@ -875,6 +917,24 @@ static esp_err_t motorAbsoluteHandler(httpd_req_t* req) {
 
     if (cmd.motor_idx < 0 || cmd.motor_idx > 1) {
         httpd_resp_send(req, "{\"error\":\"invalid motor\"}", 26);
+        return ESP_FAIL;
+    }
+
+    if (cmd.target == INT32_MIN) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "{\"error\":\"missing target\"}");
+        return ESP_FAIL;
+    }
+
+    MotorMoveResult move = validateAbsoluteMove(
+        motorAxisConfigs, 2, cmd.motor_idx, cmd.target);
+    if (!move.accepted()) {
+        char error_resp[128];
+        snprintf(error_resp, sizeof(error_resp), "{\"error\":\"%s\"}",
+                 motorMoveErrorMessage(move.error));
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, error_resp);
         return ESP_FAIL;
     }
 
@@ -897,11 +957,16 @@ static esp_err_t motorAbsoluteHandler(httpd_req_t* req) {
 
 // GET /api/v1/motor/status
 static esp_err_t motorStatusHandler(httpd_req_t* req) {
-    char resp[256];
+    char resp[512];
     snprintf(resp, sizeof(resp),
-        "{\"pan\":{\"pos\":%d,\"busy\":%s},\"tilt\":{\"pos\":%d,\"busy\":%s}}",
+        "{\"pan\":{\"pos\":%d,\"busy\":%s,\"min\":%d,\"max\":%d,\"center\":%d,\"reversed\":%s},"
+        "\"tilt\":{\"pos\":%d,\"busy\":%s,\"min\":%d,\"max\":%d,\"center\":%d,\"reversed\":%s}}",
         motors[0].pos, motors[0].busy ? "true" : "false",
-        motors[1].pos, motors[1].busy ? "true" : "false");
+        motorAxisConfigs[0].min_position, motorAxisConfigs[0].max_position,
+        motorAxisConfigs[0].center_position, motorAxisConfigs[0].reversed ? "true" : "false",
+        motors[1].pos, motors[1].busy ? "true" : "false",
+        motorAxisConfigs[1].min_position, motorAxisConfigs[1].max_position,
+        motorAxisConfigs[1].center_position, motorAxisConfigs[1].reversed ? "true" : "false");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, strlen(resp));
     return ESP_OK;
@@ -931,6 +996,137 @@ static esp_err_t motorStopHandler(httpd_req_t* req) {
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"stopped\":true}", 16);
     return ESP_OK;
+}
+
+// POST /api/v1/motor/calibrate
+static esp_err_t motorCalibrateHandler(httpd_req_t* req) {
+    char buf[64] = {0};
+    char motor_str[16] = "all";
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len > 0) {
+        buf[len] = 0;
+        jsonGetStr(buf, "motor", motor_str, sizeof(motor_str));
+    }
+
+    int motor_idx = -1;
+    if (strcmp(motor_str, "pan") == 0 || strcmp(motor_str, "0") == 0) motor_idx = 0;
+    else if (strcmp(motor_str, "tilt") == 0 || strcmp(motor_str, "1") == 0) motor_idx = 1;
+    else if (strcmp(motor_str, "all") != 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "{\"error\":\"invalid motor\"}");
+        return ESP_FAIL;
+    }
+
+    if (!calibrateMotor(motor_idx)) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_sendstr(req, "{\"error\":\"motor did not stop for calibration\"}");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"calibrated\":true}");
+    return ESP_OK;
+}
+
+static esp_err_t motorConfigGetHandler(httpd_req_t* req) {
+    char resp[384];
+    snprintf(resp, sizeof(resp),
+        "{\"version\":%u,\"pan\":{\"min\":%d,\"center\":%d,\"max\":%d,\"reversed\":%s},"
+        "\"tilt\":{\"min\":%d,\"center\":%d,\"max\":%d,\"reversed\":%s}}",
+        MOSS_MOTOR_CONFIG_VERSION,
+        motorAxisConfigs[0].min_position, motorAxisConfigs[0].center_position,
+        motorAxisConfigs[0].max_position, motorAxisConfigs[0].reversed ? "true" : "false",
+        motorAxisConfigs[1].min_position, motorAxisConfigs[1].center_position,
+        motorAxisConfigs[1].max_position, motorAxisConfigs[1].reversed ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, resp);
+    return ESP_OK;
+}
+
+static esp_err_t motorConfigPostHandler(httpd_req_t* req) {
+    char buf[256] = {0};
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) return ESP_FAIL;
+    buf[len] = 0;
+
+    int axis = jsonGetInt(buf, "motor", -1);
+    if (axis < 0 || axis >= MOSS_MOTOR_AXIS_COUNT) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "{\"error\":\"invalid motor\"}");
+        return ESP_FAIL;
+    }
+    if (motorRunning[axis]) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_sendstr(req, "{\"error\":\"motor is moving\"}");
+        return ESP_FAIL;
+    }
+
+    MotorAxisConfig proposed = motorAxisConfigs[axis];
+    proposed.min_position = jsonGetInt(buf, "min", proposed.min_position);
+    proposed.center_position = jsonGetInt(buf, "center", proposed.center_position);
+    proposed.max_position = jsonGetInt(buf, "max", proposed.max_position);
+    proposed.reversed = jsonGetInt(buf, "reversed", proposed.reversed ? 1 : 0) == 1;
+
+    if (!motorAxisConfigValid(proposed) ||
+        motors[axis].pos < proposed.min_position || motors[axis].pos > proposed.max_position) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "{\"error\":\"invalid limits or current position outside range\"}");
+        return ESP_FAIL;
+    }
+    if (!setMotorAxisConfig(axis, proposed)) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_sendstr(req, "{\"error\":\"failed to save motor config\"}");
+        return ESP_FAIL;
+    }
+
+    return motorConfigGetHandler(req);
+}
+
+static esp_err_t motorLimitCaptureHandler(httpd_req_t* req) {
+    char buf[128] = {0};
+    char limit[16] = {0};
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) return ESP_FAIL;
+    buf[len] = 0;
+
+    int axis = jsonGetInt(buf, "motor", -1);
+    jsonGetStr(buf, "limit", limit, sizeof(limit));
+    if (axis < 0 || axis >= MOSS_MOTOR_AXIS_COUNT) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "{\"error\":\"invalid motor\"}");
+        return ESP_FAIL;
+    }
+    if (motorRunning[axis]) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_sendstr(req, "{\"error\":\"motor is moving\"}");
+        return ESP_FAIL;
+    }
+
+    if (strcmp(limit, "center") == 0) {
+        if (!calibrateMotor(axis)) {
+            httpd_resp_set_status(req, "503 Service Unavailable");
+            httpd_resp_sendstr(req, "{\"error\":\"motor did not stop for calibration\"}");
+            return ESP_FAIL;
+        }
+        return motorConfigGetHandler(req);
+    }
+
+    MotorAxisConfig proposed = motorAxisConfigs[axis];
+    if (strcmp(limit, "min") == 0) {
+        proposed.min_position = motors[axis].pos;
+    } else if (strcmp(limit, "max") == 0) {
+        proposed.max_position = motors[axis].pos;
+    } else {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "{\"error\":\"limit must be min, center, or max\"}");
+        return ESP_FAIL;
+    }
+
+    if (!setMotorAxisConfig(axis, proposed)) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "{\"error\":\"captured position makes limits invalid\"}");
+        return ESP_FAIL;
+    }
+    return motorConfigGetHandler(req);
 }
 
 // POST /api/v1/camera/config
@@ -1554,6 +1750,13 @@ static esp_err_t debugHandler(httpd_req_t* req) {
     return ESP_OK;
 }
 
+static esp_err_t controlPanelHandler(httpd_req_t* req) {
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_send(req, CONTROL_PANEL_HTML, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 // ========== 临时调试端点 ==========
 
 // ========== HTTP 路由表 ==========
@@ -1561,6 +1764,10 @@ static const httpd_uri_t motorRelativeUri = {"/api/v1/motor/relative", HTTP_POST
 static const httpd_uri_t motorAbsoluteUri = {"/api/v1/motor/absolute", HTTP_POST, motorAbsoluteHandler};
 static const httpd_uri_t motorStatusUri = {"/api/v1/motor/status", HTTP_GET, motorStatusHandler};
 static const httpd_uri_t motorStopUri = {"/api/v1/motor/stop", HTTP_POST, motorStopHandler};
+static const httpd_uri_t motorCalibrateUri = {"/api/v1/motor/calibrate", HTTP_POST, motorCalibrateHandler};
+static const httpd_uri_t motorConfigGetUri = {"/api/v1/motor/config", HTTP_GET, motorConfigGetHandler};
+static const httpd_uri_t motorConfigPostUri = {"/api/v1/motor/config", HTTP_POST, motorConfigPostHandler};
+static const httpd_uri_t motorLimitCaptureUri = {"/api/v1/motor/limit/capture", HTTP_POST, motorLimitCaptureHandler};
 
 static const httpd_uri_t cameraConfigUri = {"/api/v1/camera/config", HTTP_POST, cameraConfigHandler};
 static const httpd_uri_t cameraCaptureUri = {"/api/v1/camera/capture", HTTP_GET, cameraCaptureHandler};
@@ -1587,6 +1794,7 @@ static const httpd_uri_t selfcheckUri = {"/api/v1/control/selfcheck", HTTP_POST,
 static const httpd_uri_t rebootUri = {"/api/v1/control/reboot", HTTP_POST, rebootHandler};
 static const httpd_uri_t pingUri = {"/api/v1/ping", HTTP_GET, pingHandler};
 static const httpd_uri_t debugUri = {"/api/v1/debug", HTTP_GET, debugHandler};
+static const httpd_uri_t controlPanelUri = {"/", HTTP_GET, controlPanelHandler};
 
 // 兼容旧路径
 static const httpd_uri_t captureCompatUri = {"/capture", HTTP_GET, cameraCaptureHandler};
@@ -1606,6 +1814,10 @@ void startWebServer() {
         httpd_register_uri_handler(httpServer, &motorAbsoluteUri);
         httpd_register_uri_handler(httpServer, &motorStatusUri);
         httpd_register_uri_handler(httpServer, &motorStopUri);
+        httpd_register_uri_handler(httpServer, &motorCalibrateUri);
+        httpd_register_uri_handler(httpServer, &motorConfigGetUri);
+        httpd_register_uri_handler(httpServer, &motorConfigPostUri);
+        httpd_register_uri_handler(httpServer, &motorLimitCaptureUri);
 
         httpd_register_uri_handler(httpServer, &cameraConfigUri);
         httpd_register_uri_handler(httpServer, &cameraCaptureUri);
@@ -1630,6 +1842,7 @@ void startWebServer() {
         httpd_register_uri_handler(httpServer, &rebootUri);
         httpd_register_uri_handler(httpServer, &pingUri);
         httpd_register_uri_handler(httpServer, &debugUri);
+        httpd_register_uri_handler(httpServer, &controlPanelUri);
 
         httpd_register_uri_handler(httpServer, &captureCompatUri);
         httpd_register_uri_handler(httpServer, &imageCompatUri);
@@ -1684,6 +1897,12 @@ void setup() {
     boot_time = millis();
 
     Serial.println("\n=== ESP32 Robot Firmware v1.1.0 ===");
+
+    loadMotorConfig();
+    for (int axis = 0; axis < MOSS_MOTOR_AXIS_COUNT; ++axis) {
+        motors[axis].pos = motorAxisConfigs[axis].center_position;
+        motors[axis].target_pos = motors[axis].pos;
+    }
 
     pinMode(MOTOR_SHCP, OUTPUT);
     pinMode(MOTOR_STCP, OUTPUT);

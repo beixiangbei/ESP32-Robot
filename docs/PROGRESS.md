@@ -20,17 +20,28 @@ Update it in the same commit as the related code or test evidence.
 | P0-02 | Capture a clean firmware build baseline | work | done | WSL Docker build: RAM 15.5%, Flash 27.9%, cached build 5.69s |
 | P0-03 | Make motor stop interrupt active movement | work + apartment | needs-hardware | Cancellation generation and per-step position compiled; physical stop test pending |
 | P0-04 | Release stepper coils after move/stop/error | work + apartment | needs-hardware | Release paths compiled; holding-current measurement pending |
-| P0-05 | Add initial pan/tilt software limits | work + apartment | todo | |
+| P0-05 | Add initial pan/tilt software limits | work + apartment | needs-hardware | NVS limits, capture API and embedded calibration panel implemented; phone/hardware ranges pending |
 | P0-06 | Correct timer deep-sleep wake setup | work + apartment | todo | |
 | P0-07 | Measure baseline current for every hardware state | apartment | todo | |
-| P0-08 | Add API mocks and host-side tests | work | todo | |
-| P0-09 | Define versioned configuration schema | work | todo | |
+| P0-08 | Add API mocks and host-side tests | work | in-progress | Motor policy tests and motor control panel mock pass; remaining device APIs pending |
+| P0-09 | Define versioned configuration schema | work | in-progress | Versioned motor NVS config implemented; remaining modules pending |
+
+## Control panel prototype
+
+- Full local prototype: `web/control-panel.html`
+- Preview command: `python tools/control_panel_preview.py`
+- Preview URL: `http://127.0.0.1:8766`
+- Views: overview, motion, camera, expression, voice/agent, automation, settings.
+- Visual direction: Chinese Apple-style light system UI with responsive navigation.
+- Motor controls use the mock device API; remaining views currently validate the
+  information architecture and will be connected as their firmware APIs land.
+- Desktop and 500 px narrow screenshots checked without incoherent overlap.
 
 Allowed status values: `todo`, `in-progress`, `needs-hardware`, `blocked`, `done`.
 
 ## Next actions
 
-1. At work: implement motor cancellation and coil release behind tests/mocks.
+1. At work: fix deep-sleep timer wake and extract its time calculation for tests.
 2. At work: define the versioned configuration schema for later AP provisioning.
 3. Before apartment visit: create `include/secrets.h` locally and rotate the old
    apartment Wi-Fi password because it remains in Git history.
