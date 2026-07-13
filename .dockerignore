@@ -1,0 +1,10 @@
+.git
+.pio
+.venv
+dev-hub/logs
+dev-hub/workspaces
+__pycache__
+*.log
+*.jpg
+*.png
+

@@ -1,4 +1,6 @@
 .pio
+.env
+include/secrets.h
 *.jpg
 *.png
 *.log

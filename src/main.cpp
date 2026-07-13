@@ -15,9 +15,25 @@
 #include <sys/time.h>
 #include "audio.h"
 
+#if __has_include("secrets.h")
+#include "secrets.h"
+#endif
+
+#ifndef MOSS_WIFI_SSID
+#define MOSS_WIFI_SSID ""
+#endif
+
+#ifndef MOSS_WIFI_PASSWORD
+#define MOSS_WIFI_PASSWORD ""
+#endif
+
+#ifndef MOSS_WIFI_CONNECT_TIMEOUT_MS
+#define MOSS_WIFI_CONNECT_TIMEOUT_MS 20000UL
+#endif
+
 // ========== WiFi 配置 ==========
-const char* WIFI_SSID = "Xiaomi_MC1304";
-const char* WIFI_PASSWORD = "qwertyui";
+const char* WIFI_SSID = MOSS_WIFI_SSID;
+const char* WIFI_PASSWORD = MOSS_WIFI_PASSWORD;
 const char* VERSION = "v1.1.0";
 
 // ========== 引脚定义 ==========
@@ -65,6 +81,8 @@ MotorState motors[2] = {
 volatile uint8_t motorState = 0;
 const uint8_t phaseSequence[8] = {0x08, 0x0C, 0x04, 0x06, 0x02, 0x03, 0x01, 0x09};
 volatile int motor1Seq = 0, motor2Seq = 4;
+volatile uint32_t motorCancelGeneration[2] = {0, 0};
+portMUX_TYPE motorStateMux = portMUX_INITIALIZER_UNLOCKED;
 
 Adafruit_NeoPixel strip0(LED_COUNT_0, LED_PIN_0, NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel strip1(LED_COUNT_1, LED_PIN_1, NEO_GRB + NEO_KHZ800);
@@ -207,6 +225,7 @@ struct MotorCommand {
     int target;         // 绝对目标位置 (-1表示用steps)
     int speed;
     bool accel;
+    uint32_t cancel_generation;
 };
 
 xQueueHandle motorQueue = NULL;
@@ -243,6 +262,7 @@ LedGroup leds[2] = {
 void shiftOut(uint8_t data);
 void latch();
 void updateMotorState();
+void releaseMotor(int motor_idx);
 void initLED();
 void setLedColor(int idx, uint32_t color);
 uint32_t hsvToRgb(float h, float s, float v);
@@ -275,6 +295,7 @@ void updateMotorState() {
 
 // ========== 单步电机 ==========
 void stepMotor(int motor_idx, int dir) {
+    portENTER_CRITICAL(&motorStateMux);
     if (motor_idx == 0) {
         motor1Seq = (motor1Seq + dir + 8) % 8;
         motorState = (motorState & 0xF0) | (phaseSequence[motor1Seq] & 0x0F);
@@ -283,6 +304,20 @@ void stepMotor(int motor_idx, int dir) {
         motorState = (motorState & 0x0F) | ((phaseSequence[motor2Seq] & 0x0F) << 4);
     }
     updateMotorState();
+    portEXIT_CRITICAL(&motorStateMux);
+}
+
+void releaseMotor(int motor_idx) {
+    portENTER_CRITICAL(&motorStateMux);
+    if (motor_idx == 0) {
+        motorState &= 0xF0;
+    } else if (motor_idx == 1) {
+        motorState &= 0x0F;
+    } else {
+        motorState = 0;
+    }
+    updateMotorState();
+    portEXIT_CRITICAL(&motorStateMux);
 }
 
 // ========== 速度计算 (加速度曲线) ==========
@@ -310,10 +345,15 @@ void motorTask(void* param) {
             int dir = 0;
             int steps_to_move = 0;
 
+            if (cmd.cancel_generation != motorCancelGeneration[motor_idx]) {
+                continue;
+            }
+
             if (cmd.target >= 0) {
                 int diff = cmd.target - motors[motor_idx].pos;
                 if (diff == 0) {
                     motors[motor_idx].busy = false;
+                    releaseMotor(motor_idx);
                     continue;
                 }
                 dir = diff > 0 ? 1 : -1;
@@ -325,33 +365,40 @@ void motorTask(void* param) {
 
             motors[motor_idx].busy = true;
             motors[motor_idx].speed = cmd.speed;
+            motors[motor_idx].target_pos = motors[motor_idx].pos + (dir * steps_to_move);
 
             for (int i = 0; i < steps_to_move; i++) {
+                if (cmd.cancel_generation != motorCancelGeneration[motor_idx]) {
+                    break;
+                }
                 stepMotor(motor_idx, dir);
+                motors[motor_idx].pos += dir;
                 int speed = calcSpeed(i, steps_to_move, cmd.speed, cmd.accel);
-                vTaskDelay(speed / portTICK_PERIOD_MS);
-            }
-
-            if (cmd.target >= 0) {
-                motors[motor_idx].pos = cmd.target;
-            } else {
-                motors[motor_idx].pos += cmd.steps;
+                vTaskDelay(pdMS_TO_TICKS(max(1, speed)));
             }
 
             motors[motor_idx].busy = false;
             motors[motor_idx].target_pos = motors[motor_idx].pos;
+            releaseMotor(motor_idx);
         }
     }
 }
 
 void stopMotor(int motor_idx) {
     if (motor_idx == 0 || motor_idx == 1) {
+        motorCancelGeneration[motor_idx]++;
         motors[motor_idx].busy = false;
         motors[motor_idx].target_pos = motors[motor_idx].pos;
+        releaseMotor(motor_idx);
         Serial.printf("[MOTOR] %d stopped at pos=%d\n", motor_idx, motors[motor_idx].pos);
     } else {
+        motorCancelGeneration[0]++;
+        motorCancelGeneration[1]++;
         motors[0].busy = false;
         motors[1].busy = false;
+        motors[0].target_pos = motors[0].pos;
+        motors[1].target_pos = motors[1].pos;
+        releaseMotor(-1);
         Serial.println("[MOTOR] all stopped");
     }
 }
@@ -762,7 +809,7 @@ const char* jsonGetStr(const char* buf, const char* key, char* out, size_t maxle
 
 // POST /api/v1/motor/relative
 static esp_err_t motorRelativeHandler(httpd_req_t* req) {
-    MotorCommand cmd = {0, 0, -1, 10, true};
+    MotorCommand cmd = {0, 0, -1, 10, true, 0};
 
     char buf[256];
     if (req->method == HTTP_GET) {
@@ -788,7 +835,13 @@ static esp_err_t motorRelativeHandler(httpd_req_t* req) {
         return ESP_FAIL;
     }
 
-    xQueueSend(motorQueue, &cmd, 0);
+    cmd.speed = constrain(cmd.speed, 1, 100);
+    cmd.cancel_generation = motorCancelGeneration[cmd.motor_idx];
+    if (xQueueSend(motorQueue, &cmd, 0) != pdTRUE) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_sendstr(req, "{\"error\":\"motor queue full\"}");
+        return ESP_FAIL;
+    }
 
     char resp[128];
     snprintf(resp, sizeof(resp),
@@ -801,7 +854,7 @@ static esp_err_t motorRelativeHandler(httpd_req_t* req) {
 
 // POST /api/v1/motor/absolute
 static esp_err_t motorAbsoluteHandler(httpd_req_t* req) {
-    MotorCommand cmd = {0, 0, -1, 10, true};
+    MotorCommand cmd = {0, 0, -1, 10, true, 0};
 
     char buf[256];
     if (req->method == HTTP_GET) {
@@ -825,7 +878,13 @@ static esp_err_t motorAbsoluteHandler(httpd_req_t* req) {
         return ESP_FAIL;
     }
 
-    xQueueSend(motorQueue, &cmd, 0);
+    cmd.speed = constrain(cmd.speed, 1, 100);
+    cmd.cancel_generation = motorCancelGeneration[cmd.motor_idx];
+    if (xQueueSend(motorQueue, &cmd, 0) != pdTRUE) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_sendstr(req, "{\"error\":\"motor queue full\"}");
+        return ESP_FAIL;
+    }
 
     char resp[128];
     snprintf(resp, sizeof(resp),
@@ -1583,13 +1642,29 @@ void startWebServer() {
 
 // ========== WiFi ==========
 void initWiFi() {
+    if (WIFI_SSID[0] == '\0') {
+        Serial.println("[WiFi] not configured; create include/secrets.h");
+        WiFi.mode(WIFI_OFF);
+        return;
+    }
+
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     Serial.print("[WiFi] connecting");
-    while (WiFi.status() != WL_CONNECTED) {
+    unsigned long connect_started = millis();
+    while (WiFi.status() != WL_CONNECTED &&
+           millis() - connect_started < MOSS_WIFI_CONNECT_TIMEOUT_MS) {
         delay(500);
         Serial.print(".");
     }
+
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("\n[WiFi] connection timed out; continuing offline");
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        return;
+    }
+
     Serial.printf("\n[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
 
     // NTP时间同步
