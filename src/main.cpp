@@ -94,6 +94,7 @@ struct LedCommand {
     char effect[16];    // 用固定数组替代 String
     uint32_t color;
     int speed;
+    int brightness;     // 0-100, 100为全亮
 };
 
 xQueueHandle ledQueue = NULL;
@@ -105,11 +106,12 @@ struct LedGroup {
     char effect[16];
     uint32_t color;
     int speed;
+    int brightness;  // 0-100, 默认100
 };
 
 LedGroup leds[2] = {
-    {"static", 0xFF0000, 50},
-    {"static", 0x00FF00, 50}
+    {"static", 0xFF0000, 50, 100},
+    {"static", 0x00FF00, 50, 100}
 };
 
 // ========== 函数声明 ==========
@@ -241,12 +243,14 @@ void ledTask(void* param) {
                     leds[i].effect[15] = 0;
                     leds[i].color = cmd.color;
                     leds[i].speed = cmd.speed;
+                    leds[i].brightness = cmd.brightness;
                 }
             } else if (cmd.led_idx >= 0 && cmd.led_idx < 2) {
                 strncpy(leds[cmd.led_idx].effect, cmd.effect, 15);
                 leds[cmd.led_idx].effect[15] = 0;
                 leds[cmd.led_idx].color = cmd.color;
                 leds[cmd.led_idx].speed = cmd.speed;
+                leds[cmd.led_idx].brightness = cmd.brightness;
             }
         }
         // 持续更新 LED 动画
@@ -283,14 +287,32 @@ uint32_t hsvToRgb(float h, float s, float v) {
     return strip0.Color((r + m) * 255, (g + m) * 255, (b + m) * 255);
 }
 
+// 根据亮度缩放颜色 (brightness: 0-100)
+uint32_t applyBrightness(uint32_t color, int brightness) {
+    if (brightness >= 100) return color;
+    if (brightness <= 0) return 0;
+    uint8_t r = (color >> 16) & 0xFF;
+    uint8_t g = (color >> 8) & 0xFF;
+    uint8_t b = color & 0xFF;
+    float scale = brightness / 100.0;
+    return strip0.Color(r * scale, g * scale, b * scale);
+}
+
 void ledUpdate() {
     unsigned long now = millis();
-    bool lowBatteryWarn = false;
+    static bool lowBatteryWarn = false;  // 保持状态，避免抖动
+    static int warnEnterPct = 0;  // 进入警告时的电量
 
     float battery_v = readBatteryVoltage();
     int battery_pct = voltageToPercent(battery_v);
-    if (battery_pct < 20 && !isCharging()) {
+    bool charging = isCharging();
+
+    // 迟滞逻辑：进入警告需要 <15%，退出需要 >25%（或正在充电）
+    if (!lowBatteryWarn && battery_pct < 15 && !charging) {
         lowBatteryWarn = true;
+        warnEnterPct = battery_pct;
+    } else if (lowBatteryWarn && (battery_pct > 25 || charging)) {
+        lowBatteryWarn = false;
     }
 
     for (int idx = 0; idx < 2; idx++) {
@@ -305,8 +327,10 @@ void ledUpdate() {
             if (now - led_last_update[idx] > period) {
                 led_last_update[idx] = now;
                 led_animation_step[idx] = !led_animation_step[idx];
+                // 低电量闪烁：亮度降低到用户设置的5%
+                uint32_t dimRed = applyBrightness(0xFF0000, 5);
                 for (int i = 0; i < count; i++) {
-                    strip->setPixelColor(i, led_animation_step[idx] ? 0xFF0000 : 0);
+                    strip->setPixelColor(i, led_animation_step[idx] ? dimRed : 0);
                 }
                 strip->show();
             }
@@ -320,7 +344,8 @@ void ledUpdate() {
         }
         else if (strcmp(effect, "static") == 0) {
             led_last_update[idx] = now;
-            for (int i = 0; i < count; i++) strip->setPixelColor(i, color);
+            uint32_t dimColor = applyBrightness(color, leds[idx].brightness);
+            for (int i = 0; i < count; i++) strip->setPixelColor(i, dimColor);
             strip->show();
         }
         else if (strcmp(effect, "blink") == 0) {
@@ -328,8 +353,9 @@ void ledUpdate() {
             if (now - led_last_update[idx] > period / 2) {
                 led_last_update[idx] = now;
                 led_animation_step[idx] = !led_animation_step[idx];
+                uint32_t dimColor = applyBrightness(color, leds[idx].brightness);
                 for (int i = 0; i < count; i++) {
-                    strip->setPixelColor(i, led_animation_step[idx] ? color : 0);
+                    strip->setPixelColor(i, led_animation_step[idx] ? dimColor : 0);
                 }
                 strip->show();
             }
@@ -337,9 +363,12 @@ void ledUpdate() {
         else if (strcmp(effect, "breath") == 0) {
             int period = 20000 / constrain(speed, 1, 100);
             float t = fmod((float)(now % period) / period, 1.0);
-            float brightness = sin(t * 3.14159) * 0.5 + 0.5;
+            float animBrightness = sin(t * 3.14159) * 0.5 + 0.5;
+            float userBrightness = leds[idx].brightness / 100.0;
             uint8_t r = (color >> 16) & 0xFF, g = (color >> 8) & 0xFF, b = color & 0xFF;
-            uint32_t c = strip->Color(r * brightness, g * brightness, b * brightness);
+            uint32_t c = strip->Color(r * animBrightness * userBrightness,
+                                       g * animBrightness * userBrightness,
+                                       b * animBrightness * userBrightness);
             for (int i = 0; i < count; i++) strip->setPixelColor(i, c);
             strip->show();
         }
@@ -348,7 +377,8 @@ void ledUpdate() {
             if (now - led_last_update[idx] > period / 360) {
                 led_last_update[idx] = now;
                 led_animation_step[idx] = (led_animation_step[idx] + 1) % 360;
-                uint32_t c = hsvToRgb(led_animation_step[idx], 1.0, 1.0);
+                float brightScale = leds[idx].brightness / 100.0;
+                uint32_t c = hsvToRgb(led_animation_step[idx], 1.0, brightScale);
                 for (int i = 0; i < count; i++) strip->setPixelColor(i, c);
                 strip->show();
             }
@@ -356,9 +386,12 @@ void ledUpdate() {
         else if (strcmp(effect, "pulse") == 0) {
             int period = 10000 / constrain(speed, 1, 100);
             float t = fmod((float)(now % period) / period, 1.0);
-            float brightness = pow(sin(t * 3.14159), 2);
+            float animBrightness = pow(sin(t * 3.14159), 2);
+            float userBrightness = leds[idx].brightness / 100.0;
             uint8_t r = (color >> 16) & 0xFF, g = (color >> 8) & 0xFF, b = color & 0xFF;
-            uint32_t c = strip->Color(r * brightness, g * brightness, b * brightness);
+            uint32_t c = strip->Color(r * animBrightness * userBrightness,
+                                       g * animBrightness * userBrightness,
+                                       b * animBrightness * userBrightness);
             for (int i = 0; i < count; i++) strip->setPixelColor(i, c);
             strip->show();
         }
@@ -427,19 +460,55 @@ void initBattery() {
 }
 
 float readBatteryVoltage() {
-    int raw = analogRead(VBAT_ADC);
-    float v_adc = raw / 4095.0 * 3.3;
-    return v_adc * 2.0;
+    // 采样平均，减少噪声
+    const int samples = 16;
+    float sum = 0;
+    for (int i = 0; i < samples; i++) {
+        sum += analogRead(VBAT_ADC);
+        delayMicroseconds(100);
+    }
+    float raw_avg = sum / samples;
+    // ESP32-S3 ADC: 12位 (0-4095), 参考电压 3.3V
+    // 分压电阻: VBAT --[R1]--+--[R2]-- GND
+    // 实际使用中分压比可能不是严格的 2:1，需要校准
+    float v_adc = raw_avg / 4095.0 * 3.3;
+    return v_adc * 2.0;  // 假设分压比 2:1
 }
 
+// 3.7V LiPo 电池电压曲线（近似）：
+// 4.2V = 100%, 3.7V = ~60%, 3.5V = ~40%, 3.0V = ~5%, 3.3V = 20%
 int voltageToPercent(float v) {
     if (v >= 4.2) return 100;
-    if (v <= 3.3) return 0;
-    return (int)((v - 3.3) / (4.2 - 3.3) * 100);
+    if (v <= 3.0) return 0;
+    if (v <= 3.3) return (int)((v - 3.0) / 0.3 * 20);  // 3.0-3.3V: 0-20%
+    if (v <= 3.7) return (int)(20 + (v - 3.3) / 0.4 * 40);  // 3.3-3.7V: 20-60%
+    return (int)(60 + (v - 3.7) / 0.5 * 40);  // 3.7-4.2V: 60-100%
 }
 
 bool isCharging() {
-    return digitalRead(USB_CHG) == HIGH;
+    // 充电检测需要稳定的电平，添加去抖
+    static unsigned long last_change = 0;
+    static int last_state = -1;
+    static int stable_count = 0;
+
+    int current = digitalRead(USB_CHG);
+    unsigned long now = millis();
+
+    if (current != last_state) {
+        last_change = now;
+        last_state = current;
+        stable_count = 0;
+        return last_state == HIGH;  // 返回上一次稳定状态
+    }
+
+    // 消抖 100ms
+    if (now - last_change > 100) {
+        stable_count++;
+        if (stable_count > 5) {  // 连续5次稳定才确认状态
+            return current == HIGH;
+        }
+    }
+    return last_state == HIGH;
 }
 
 // ========== Monitor Task ==========
@@ -777,6 +846,7 @@ static esp_err_t ledEffectHandler(httpd_req_t* req) {
     cmd.effect[15] = 0;
     cmd.color = 0xFF0000;
     cmd.speed = 50;
+    cmd.brightness = 100;  // 默认全亮
 
     char buf[256];
     if (req->method == HTTP_GET) {
@@ -793,6 +863,7 @@ static esp_err_t ledEffectHandler(httpd_req_t* req) {
             cmd.color = parseHexColor(color_str);
         }
         cmd.speed = getQueryParamInt(req, "speed", 50);
+        cmd.brightness = getQueryParamInt(req, "brightness", 100);
     } else {
         int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
         if (len <= 0) return ESP_FAIL;
@@ -800,6 +871,7 @@ static esp_err_t ledEffectHandler(httpd_req_t* req) {
 
         cmd.led_idx = jsonGetInt(buf, "target", -1);
         cmd.speed = jsonGetInt(buf, "speed", 50);
+        cmd.brightness = jsonGetInt(buf, "brightness", 100);
 
         char effect_str[32] = {0};
         if (jsonGetStr(buf, "effect", effect_str, sizeof(effect_str))) {
@@ -817,8 +889,8 @@ static esp_err_t ledEffectHandler(httpd_req_t* req) {
 
     char resp[128];
     snprintf(resp, sizeof(resp),
-        "{\"led\":%d,\"effect\":\"%s\",\"color\":\"%06X\",\"speed\":%d}",
-        cmd.led_idx, cmd.effect, cmd.color, cmd.speed);
+        "{\"led\":%d,\"effect\":\"%s\",\"color\":\"%06X\",\"speed\":%d,\"brightness\":%d}",
+        cmd.led_idx, cmd.effect, cmd.color, cmd.speed, cmd.brightness);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, strlen(resp));
     return ESP_OK;
@@ -876,10 +948,10 @@ static esp_err_t ledSegmentsHandler(httpd_req_t* req) {
 static esp_err_t ledStatusHandler(httpd_req_t* req) {
     char resp[256];
     snprintf(resp, sizeof(resp),
-        "{\"0\":{\"effect\":\"%s\",\"color\":\"%06X\",\"speed\":%d},"
-        "\"1\":{\"effect\":\"%s\",\"color\":\"%06X\",\"speed\":%d}}",
-        leds[0].effect, leds[0].color, leds[0].speed,
-        leds[1].effect, leds[1].color, leds[1].speed);
+        "{\"0\":{\"effect\":\"%s\",\"color\":\"%06X\",\"speed\":%d,\"brightness\":%d},"
+        "\"1\":{\"effect\":\"%s\",\"color\":\"%06X\",\"speed\":%d,\"brightness\":%d}}",
+        leds[0].effect, leds[0].color, leds[0].speed, leds[0].brightness,
+        leds[1].effect, leds[1].color, leds[1].speed, leds[1].brightness);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, strlen(resp));
     return ESP_OK;
