@@ -11,7 +11,6 @@ metadata:
       {
         "emoji": "🤖",
         "requires": { "bins": ["python3"], "pip": ["requests"] },
-        "install": ["pip install requests"],
       },
   }
 ---
@@ -54,35 +53,35 @@ metadata:
 
 ```bash
 # 显示表情
-python3 esp32_robot_skill.py emotion happy
-python3 esp32_robot_skill.py emotion think
+python3 {baseDir}/esp32_robot_skill.py emotion happy
+python3 {baseDir}/esp32_robot_skill.py emotion think
 
 # 显示自定义文字
-python3 esp32_robot_skill.py text "Hello" --line 0 --size 2
+python3 {baseDir}/esp32_robot_skill.py text "Hello" --line 0 --size 2
 
 # LED控制
-python3 esp32_robot_skill.py led rainbow --brightness 50
-python3 esp32_robot_skill.py led off
+python3 {baseDir}/esp32_robot_skill.py led rainbow --brightness 50
+python3 {baseDir}/esp32_robot_skill.py led off
 
 # 云台控制
-python3 esp32_robot_skill.py look --pan 500 --tilt 300
-python3 esp32_robot_skill.py center
-python3 esp32_robot_skill.py look-around --style slow
+python3 {baseDir}/esp32_robot_skill.py look --pan 500 --tilt 300
+python3 {baseDir}/esp32_robot_skill.py center
+python3 {baseDir}/esp32_robot_skill.py look-around --style slow
 
 # 摄像头
-python3 esp32_robot_skill.py capture --save /tmp/photo.jpg
+python3 {baseDir}/esp32_robot_skill.py capture --save /tmp/photo.jpg
 
 # 音频
-python3 esp32_robot_skill.py beep
-python3 esp32_robot_skill.py listen
+python3 {baseDir}/esp32_robot_skill.py beep
+python3 {baseDir}/esp32_robot_skill.py listen
 
 # 系统
-python3 esp32_robot_skill.py status
-python3 esp32_robot_skill.py battery
+python3 {baseDir}/esp32_robot_skill.py status
+python3 {baseDir}/esp32_robot_skill.py battery
 
 # 便捷方法
-python3 esp32_robot_skill.py wake-up    # 显示开心表情
-python3 esp32_robot_skill.py sleep      # 关闭显示和LED
+python3 {baseDir}/esp32_robot_skill.py wake-up    # 显示开心表情
+python3 {baseDir}/esp32_robot_skill.py sleep      # 关闭显示和LED
 ```
 
 ## 命令详情
