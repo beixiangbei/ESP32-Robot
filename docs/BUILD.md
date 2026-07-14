@@ -44,17 +44,14 @@ PlatformIO writes build output under:
 The `.pio` directory is intentionally excluded from Git. Firmware must be built
 from a recorded Git commit before hardware verification.
 
-## Local Wi-Fi configuration
+## Wi-Fi provisioning
 
-Wi-Fi credentials are not stored in tracked source files. Create the local file:
+Wi-Fi credentials are configured from the embedded control panel and stored in
+ESP32 NVS. Source builds do not contain apartment credentials.
 
-```powershell
-Copy-Item include\secrets.example.h include\secrets.h
-```
-
-Then edit `include/secrets.h`. The file is ignored by Git. A build without this
-file is valid; the device will continue booting offline instead of waiting forever
-for Wi-Fi. AP provisioning will replace this temporary mechanism in phase P2.
+An unconfigured device or a device that cannot connect within 20 seconds starts
+`MOSS-Setup-XXXX` with password `moss-setup`. Connect to it and open
+`http://192.168.4.1/`.
 
 The password previously stored in `src/main.cpp` remains in Git history and must
 be rotated before the device is used again.

@@ -3,6 +3,9 @@
 #include <esp_http_server.h>
 #include <esp_system.h>
 #include <esp_sleep.h>
+#include <ArduinoJson.h>
+#include <DNSServer.h>
+#include <ESPmDNS.h>
 #include <WiFi.h>
 #include <Wire.h>
 #include <Adafruit_NeoPixel.h>
@@ -14,29 +17,16 @@
 #include <time.h>
 #include <sys/time.h>
 #include "audio.h"
-#include "control_panel.h"
+#include "control_panel_generated.h"
 #include "motor_config.h"
 #include "motor_policy.h"
-
-#if __has_include("secrets.h")
-#include "secrets.h"
-#endif
-
-#ifndef MOSS_WIFI_SSID
-#define MOSS_WIFI_SSID ""
-#endif
-
-#ifndef MOSS_WIFI_PASSWORD
-#define MOSS_WIFI_PASSWORD ""
-#endif
+#include "network_config.h"
 
 #ifndef MOSS_WIFI_CONNECT_TIMEOUT_MS
 #define MOSS_WIFI_CONNECT_TIMEOUT_MS 20000UL
 #endif
 
 // ========== WiFi 配置 ==========
-const char* WIFI_SSID = MOSS_WIFI_SSID;
-const char* WIFI_PASSWORD = MOSS_WIFI_PASSWORD;
 const char* VERSION = "v1.1.0";
 
 // ========== 引脚定义 ==========
@@ -99,8 +89,13 @@ int led_animation_step[2] = {0, 0};
 bool camera_enabled = false;
 unsigned long boot_time = 0;
 httpd_handle_t httpServer = NULL;
+DNSServer captiveDnsServer;
+bool captivePortalActive = false;
+char provisioningApSsid[32] = {0};
+volatile bool networkRebootScheduled = false;
+unsigned long networkRebootAt = 0;
 bool self_check_passed = false;  // 启动自检是否通过
-bool sleep_scheduled = true;     // 是否启用定时休眠 (2:00-8:00)
+bool sleep_scheduled = false;    // 有可靠唤醒方式前禁用 Deep Sleep
 bool boot_in_progress = true;    // 启动中，禁止ledTask控制LED
 
 // ========== RTC 内存 (Deep Sleep保留) ==========
@@ -1668,6 +1663,17 @@ static esp_err_t oledStatusHandler(httpd_req_t* req) {
 }
 
 // GET /api/v1/status
+static esp_err_t capabilitiesHandler(httpd_req_t* req) {
+    static const char response[] =
+        "{\"motor\":true,\"network\":true,\"camera\":true,"
+        "\"oled\":true,\"led\":true,\"audio\":true,\"system\":true,"
+        "\"power_config\":false,\"agent\":false,"
+        "\"automation\":false,\"ota\":false}";
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 static esp_err_t statusHandler(httpd_req_t* req) {
     float v = readBatteryVoltage();
     int pct = voltageToPercent(v);
@@ -1732,6 +1738,126 @@ static esp_err_t pingHandler(httpd_req_t* req) {
 }
 
 // GET /api/v1/debug - 调试端点
+static bool validHostname(const char* hostname) {
+    if (!hostname || hostname[0] == '\0') return false;
+    size_t length = strlen(hostname);
+    if (length > 32 || hostname[0] == '-' || hostname[length - 1] == '-') return false;
+    for (size_t i = 0; i < length; ++i) {
+        char c = hostname[i];
+        if (!isalnum(static_cast<unsigned char>(c)) && c != '-') return false;
+    }
+    return true;
+}
+
+static esp_err_t networkStatusHandler(httpd_req_t* req) {
+    JsonDocument doc;
+    bool connected = WiFi.status() == WL_CONNECTED;
+    doc["connected"] = connected;
+    doc["configured"] = mossNetworkConfig.configured;
+    doc["mode"] = captivePortalActive ? "ap_sta" : "sta";
+    doc["ssid"] = connected ? WiFi.SSID() : "";
+    doc["hostname"] = mossNetworkConfig.hostname;
+    doc["ip"] = connected ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+    doc["rssi"] = connected ? WiFi.RSSI() : 0;
+    doc["ap_active"] = captivePortalActive;
+    doc["ap_ssid"] = captivePortalActive ? provisioningApSsid : "";
+
+    String response;
+    serializeJson(doc, response);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, response.c_str(), response.length());
+    return ESP_OK;
+}
+
+static esp_err_t networkScanHandler(httpd_req_t* req) {
+    int count = WiFi.scanNetworks(false, true);
+    JsonDocument doc;
+    JsonArray networks = doc["networks"].to<JsonArray>();
+    for (int i = 0; i < count; ++i) {
+        JsonObject network = networks.add<JsonObject>();
+        network["ssid"] = WiFi.SSID(i);
+        network["rssi"] = WiFi.RSSI(i);
+        network["secure"] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+    }
+    WiFi.scanDelete();
+
+    String response;
+    serializeJson(doc, response);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, response.c_str(), response.length());
+    return ESP_OK;
+}
+
+static esp_err_t networkConfigHandler(httpd_req_t* req) {
+    if (req->content_len <= 0 || req->content_len >= 512) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "{\"error\":\"invalid request body\"}");
+        return ESP_FAIL;
+    }
+
+    char body[512] = {0};
+    int received = 0;
+    while (received < req->content_len) {
+        int result = httpd_req_recv(req, body + received, req->content_len - received);
+        if (result <= 0) return ESP_FAIL;
+        received += result;
+    }
+    body[received] = '\0';
+
+    JsonDocument doc;
+    if (deserializeJson(doc, body) != DeserializationError::Ok) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "{\"error\":\"invalid JSON\"}");
+        return ESP_FAIL;
+    }
+
+    const char* ssid = doc["ssid"] | "";
+    const char* hostname = doc["hostname"] | mossNetworkConfig.hostname;
+    bool passwordProvided = !doc["password"].isNull();
+    const char* password = passwordProvided
+        ? doc["password"].as<const char*>()
+        : (mossNetworkConfig.configured && strcmp(ssid, mossNetworkConfig.ssid) == 0
+            ? mossNetworkConfig.password : "");
+    size_t passwordLength = strlen(password);
+    if (ssid[0] == '\0' || strlen(ssid) > 32 || !validHostname(hostname) ||
+        (passwordLength > 0 && passwordLength < 8) || passwordLength > 64) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "{\"error\":\"invalid SSID, password, or hostname\"}");
+        return ESP_FAIL;
+    }
+    if (!saveNetworkConfig(ssid, password, hostname)) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_sendstr(req, "{\"error\":\"failed to save network config\"}");
+        return ESP_FAIL;
+    }
+
+    networkRebootAt = millis() + 1500;
+    networkRebootScheduled = true;
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"saved\":true,\"restarting\":true}");
+    return ESP_OK;
+}
+
+static esp_err_t networkForgetHandler(httpd_req_t* req) {
+    if (!clearNetworkConfig()) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_sendstr(req, "{\"error\":\"failed to clear network config\"}");
+        return ESP_FAIL;
+    }
+    networkRebootAt = millis() + 1500;
+    networkRebootScheduled = true;
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"forgotten\":true,\"restarting\":true}");
+    return ESP_OK;
+}
+
+static esp_err_t captivePortalHandler(httpd_req_t* req) {
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
 static esp_err_t debugHandler(httpd_req_t* req) {
     char resp[512];
     snprintf(resp, sizeof(resp),
@@ -1789,12 +1915,18 @@ static const httpd_uri_t audioSpeakerTestUri = {"/api/v1/audio/speaker/test", HT
 static const httpd_uri_t audioMicTestUri = {"/api/v1/audio/mic/test", HTTP_GET, audioMicTestHandler};
 static const httpd_uri_t audioStatusUri = {"/api/v1/audio/status", HTTP_GET, audioStatusHandler};
 
+static const httpd_uri_t capabilitiesUri = {"/api/v1/capabilities", HTTP_GET, capabilitiesHandler};
 static const httpd_uri_t statusUri = {"/api/v1/status", HTTP_GET, statusHandler};
 static const httpd_uri_t selfcheckUri = {"/api/v1/control/selfcheck", HTTP_POST, selfcheckHandler};
 static const httpd_uri_t rebootUri = {"/api/v1/control/reboot", HTTP_POST, rebootHandler};
 static const httpd_uri_t pingUri = {"/api/v1/ping", HTTP_GET, pingHandler};
+static const httpd_uri_t networkStatusUri = {"/api/v1/network/status", HTTP_GET, networkStatusHandler};
+static const httpd_uri_t networkScanUri = {"/api/v1/network/scan", HTTP_GET, networkScanHandler};
+static const httpd_uri_t networkConfigUri = {"/api/v1/network/config", HTTP_POST, networkConfigHandler};
+static const httpd_uri_t networkForgetUri = {"/api/v1/network/forget", HTTP_POST, networkForgetHandler};
 static const httpd_uri_t debugUri = {"/api/v1/debug", HTTP_GET, debugHandler};
 static const httpd_uri_t controlPanelUri = {"/", HTTP_GET, controlPanelHandler};
+static const httpd_uri_t captivePortalUri = {"/*", HTTP_GET, captivePortalHandler};
 
 // 兼容旧路径
 static const httpd_uri_t captureCompatUri = {"/capture", HTTP_GET, cameraCaptureHandler};
@@ -1804,8 +1936,9 @@ static const httpd_uri_t imageCompatUri = {"/image", HTTP_GET, cameraCaptureHand
 void startWebServer() {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = 80;
-    cfg.max_uri_handlers = 32;
+    cfg.max_uri_handlers = 40;
     cfg.stack_size = 8192;
+    cfg.uri_match_fn = httpd_uri_match_wildcard;
 
     Serial.println("[HTTP] server starting...");
 
@@ -1837,15 +1970,21 @@ void startWebServer() {
         httpd_register_uri_handler(httpServer, &audioMicTestUri);
         httpd_register_uri_handler(httpServer, &audioStatusUri);
 
+        httpd_register_uri_handler(httpServer, &capabilitiesUri);
         httpd_register_uri_handler(httpServer, &statusUri);
         httpd_register_uri_handler(httpServer, &selfcheckUri);
         httpd_register_uri_handler(httpServer, &rebootUri);
         httpd_register_uri_handler(httpServer, &pingUri);
+        httpd_register_uri_handler(httpServer, &networkStatusUri);
+        httpd_register_uri_handler(httpServer, &networkScanUri);
+        httpd_register_uri_handler(httpServer, &networkConfigUri);
+        httpd_register_uri_handler(httpServer, &networkForgetUri);
         httpd_register_uri_handler(httpServer, &debugUri);
         httpd_register_uri_handler(httpServer, &controlPanelUri);
 
         httpd_register_uri_handler(httpServer, &captureCompatUri);
         httpd_register_uri_handler(httpServer, &imageCompatUri);
+        httpd_register_uri_handler(httpServer, &captivePortalUri);
 
         Serial.println("[HTTP] server started");
     } else {
@@ -1854,15 +1993,44 @@ void startWebServer() {
 }
 
 // ========== WiFi ==========
+void startProvisioningAp() {
+    uint32_t suffix = static_cast<uint32_t>(ESP.getEfuseMac() & 0xFFFF);
+    snprintf(provisioningApSsid, sizeof(provisioningApSsid), "MOSS-Setup-%04X", suffix);
+    WiFi.mode(WIFI_AP_STA);
+    if (!WiFi.softAP(provisioningApSsid, "moss-setup")) {
+        Serial.println("[WiFi] provisioning AP failed");
+        return;
+    }
+    captiveDnsServer.start(53, "*", WiFi.softAPIP());
+    captivePortalActive = true;
+    Serial.printf("[WiFi] provisioning AP: %s\n", provisioningApSsid);
+    Serial.printf("[WiFi] setup URL: http://%s/\n", WiFi.softAPIP().toString().c_str());
+
+    display.clearDisplay();
+    display.setRotation(oled_rotation);
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("Wi-Fi Setup");
+    display.println(provisioningApSsid);
+    display.println("Pass: moss-setup");
+    display.println(WiFi.softAPIP());
+    display.display();
+}
+
 void initWiFi() {
-    if (WIFI_SSID[0] == '\0') {
-        Serial.println("[WiFi] not configured; create include/secrets.h");
-        WiFi.mode(WIFI_OFF);
+    const char* ssid = mossNetworkConfig.configured ? mossNetworkConfig.ssid : "";
+    const char* password = mossNetworkConfig.configured ? mossNetworkConfig.password : "";
+    WiFi.setHostname(mossNetworkConfig.hostname);
+
+    if (ssid[0] == '\0') {
+        Serial.println("[WiFi] not configured; starting provisioning AP");
+        startProvisioningAp();
         return;
     }
 
     WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    WiFi.begin(ssid, password);
     Serial.print("[WiFi] connecting");
     unsigned long connect_started = millis();
     while (WiFi.status() != WL_CONNECTED &&
@@ -1872,13 +2040,29 @@ void initWiFi() {
     }
 
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("\n[WiFi] connection timed out; continuing offline");
-        WiFi.disconnect(true);
-        WiFi.mode(WIFI_OFF);
+        Serial.println("\n[WiFi] connection timed out; starting provisioning AP");
+        WiFi.disconnect(false, false);
+        startProvisioningAp();
         return;
     }
 
     Serial.printf("\n[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
+    if (MDNS.begin(mossNetworkConfig.hostname)) {
+        MDNS.addService("http", "tcp", 80);
+        Serial.printf("[WiFi] mDNS: http://%s.local/\n", mossNetworkConfig.hostname);
+    } else {
+        Serial.println("[WiFi] mDNS failed");
+    }
+
+    display.clearDisplay();
+    display.setRotation(oled_rotation);
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("Wi-Fi Connected");
+    display.println(mossNetworkConfig.hostname);
+    display.println(WiFi.localIP());
+    display.display();
 
     // NTP时间同步
     syncNTPTime();
@@ -1887,6 +2071,19 @@ void initWiFi() {
     if (shouldSleep()) {
         enterSleep();
         // 不会执行到这里
+    }
+}
+
+void networkTask(void* param) {
+    while (1) {
+        if (captivePortalActive) {
+            captiveDnsServer.processNextRequest();
+        }
+        if (networkRebootScheduled &&
+            static_cast<long>(millis() - networkRebootAt) >= 0) {
+            esp_restart();
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
@@ -1899,6 +2096,7 @@ void setup() {
     Serial.println("\n=== ESP32 Robot Firmware v1.1.0 ===");
 
     loadMotorConfig();
+    loadNetworkConfig();
     for (int axis = 0; axis < MOSS_MOTOR_AXIS_COUNT; ++axis) {
         motors[axis].pos = motorAxisConfigs[axis].center_position;
         motors[axis].target_pos = motors[axis].pos;
@@ -1959,6 +2157,7 @@ void setup() {
     xTaskCreatePinnedToCore(motorTask, "motor", 4096, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(ledTask, "led", 4096, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(monitorTask, "monitor", 4096, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(networkTask, "network", 3072, NULL, 1, NULL, 1);
 
     // 自检通过：绿色5秒
     Serial.println("[BOOT] Self-check passed!");
@@ -1975,7 +2174,8 @@ void setup() {
     startWebServer();
 
     Serial.println("\n=== Ready ===");
-    Serial.printf("IP: http://%s\n", WiFi.localIP().toString().c_str());
+    IPAddress controlAddress = WiFi.status() == WL_CONNECTED ? WiFi.localIP() : WiFi.softAPIP();
+    Serial.printf("IP: http://%s\n", controlAddress.toString().c_str());
     Serial.printf("Motor status: /api/v1/motor/status\n");
     Serial.printf("Camera capture: /api/v1/camera/capture\n");
     Serial.printf("LED control: /api/v1/led/effect\n");

@@ -14,6 +14,7 @@
 | 接口 | 说明 | 返回示例 |
 |------|------|----------|
 | `/api/v1/ping` | 连通性测试 | `{"ok":true}` |
+| `/api/v1/capabilities` | 控制面板功能可用性 | JSON 对象 |
 | `/api/v1/status` | 完整系统状态 | JSON 对象 |
 | `/api/v1/motor/status` | 电机位置状态 | `{"pan":{"pos":0,"busy":false},"tilt":{"pos":0,"busy":false}}` |
 | `/api/v1/led/status` | LED 状态 | `{"0":{"effect":"static","color":"FF0000"},"1":{"effect":"static","color":"00FF00"}}` |
@@ -139,7 +140,32 @@ curl -X POST -H "Content-Type: application/json" -d "{\"reason\":\"test\"}" http
 
 ---
 
-## 五、架构设计
+## 五、网络与配网
+
+设备没有网络配置或连接超时后，会启动 `MOSS-Setup-XXXX` 热点。热点密码为 `moss-setup`，控制面板地址为 `http://192.168.4.1/`。
+
+```text
+GET  /api/v1/network/status
+GET  /api/v1/network/scan
+POST /api/v1/network/config
+POST /api/v1/network/forget
+```
+
+保存网络配置：
+
+```json
+{
+  "ssid": "Apartment-WiFi",
+  "password": "network-password",
+  "hostname": "moss-home"
+}
+```
+
+配置保存到版本化 NVS，成功后设备自动重启。状态和扫描接口不会返回已保存密码。
+
+---
+
+## 六、架构设计
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -158,7 +184,7 @@ FreeRTOS Tasks:
 
 ---
 
-## 六、版本历史
+## 七、版本历史
 
 | 版本 | 日期 | 说明 |
 |------|------|------|

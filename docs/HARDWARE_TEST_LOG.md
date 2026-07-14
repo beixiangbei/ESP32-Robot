@@ -66,6 +66,23 @@ Soft-limit and calibration checks:
 7. Save limits and direction, reboot the ESP32, and confirm the same values load
    from NVS.
 
+Wi-Fi provisioning checks:
+
+1. Flash after clearing NVS and confirm `MOSS-Setup-XXXX` appears.
+2. Connect with password `moss-setup`; confirm the captive page opens or manually
+   open `http://192.168.4.1/`.
+3. Scan networks, choose the apartment Wi-Fi, enter the new password and save.
+4. Confirm the ESP32 restarts, joins the apartment Wi-Fi and reports the expected
+   hostname, IP and RSSI without returning the password.
+5. Reboot again and confirm NVS reconnect works without opening the setup AP.
+6. Enter an incorrect password and confirm the device falls back to AP mode after
+   the 20-second connection timeout.
+7. Use Forget Network and confirm the device restarts in AP provisioning mode.
+8. Confirm the OLED shows the setup SSID, setup password and `192.168.4.1` while
+   the provisioning AP is active.
+9. After a successful connection, confirm the OLED shows the assigned IP and
+   `http://<hostname>.local/` resolves from the phone or laptop.
+
 Acceptance evidence:
 
 - Raw measurements entered in the matrix.

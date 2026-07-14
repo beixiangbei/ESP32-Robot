@@ -21,8 +21,9 @@
 - I2S 扬声器测试音和麦克风音量读取
 - 电池电压、电量和充电状态检测
 - Wi-Fi、NTP、系统状态、自检、调试和重启接口
-- 固件内嵌的云台校准页面
-- 中文 Apple 风格完整控制台交互原型
+- AP 配网、Wi-Fi 扫描、NVS 网络配置和连接失败回退
+- 固件内嵌的中文 Apple 风格完整控制面板
+- 控制面板接入系统状态、配网、云台、摄像头、OLED、LED、音频和系统操作
 - WSL Docker 固件构建和纯 C++ 主机测试
 
 ### 等待硬件验证
@@ -38,7 +39,7 @@
 ### 规划中
 
 - 四级电源状态：Active、Idle、Light Sleep、Deep Sleep
-- AP 配网、管理员认证和完整设备配置
+- 管理员认证和完整设备配置
 - OTA、回滚和恢复出厂
 - 本地规则引擎
 - HPT630 Agent 网关
@@ -91,24 +92,23 @@ git clone https://github.com/beixiangbei/ESP32-Robot.git
 cd ESP32-Robot
 ```
 
-### 2. 配置本地 Wi-Fi
+### 2. 首次配网
 
-真实凭据不进入 Git：
+Wi-Fi 凭据通过控制面板写入 ESP32 NVS，不需要修改或重新编译源码。
 
-```powershell
-Copy-Item include\secrets.example.h include\secrets.h
+首次启动、清除网络配置或连接超时后，设备自动创建热点：
+
+```text
+热点：MOSS-Setup-XXXX
+密码：moss-setup
+地址：http://192.168.4.1/
 ```
 
-编辑 `include/secrets.h`：
+手机连接热点后，系统通常会自动打开配网页面；没有自动打开时，手动访问 `http://192.168.4.1/`。在“网络与配网”区域扫描 Wi-Fi，填写密码和设备名称，然后点击“保存并重启”。
 
-```cpp
-#define MOSS_WIFI_SSID "your-wifi-name"
-#define MOSS_WIFI_PASSWORD "your-wifi-password"
-```
+连接成功后，OLED 会显示设备 IP。局域网支持 mDNS 时，也可以访问 `http://<设备名称>.local/`。
 
-`include/secrets.h` 已被 Git 忽略。没有该文件时固件仍可编译，并在 Wi-Fi 未配置或连接超时后继续离线启动。
-
-旧版本曾提交过真实 Wi-Fi 密码，该密码必须更换，不能继续使用。
+密码只写入 NVS，不通过状态 API 返回，也不进入日志或 Git。旧版本曾提交过真实 Wi-Fi 密码，该密码必须更换，不能继续使用。
 
 ### 3. 使用 WSL Docker 构建
 
@@ -129,8 +129,8 @@ Copy-Item include\secrets.example.h include\secrets.h
 ```text
 PlatformIO Core 6.1.18
 espressif32 7.0.1
-RAM 约 15.6%
-Flash 约 28.4%
+RAM 约 16.4%
+Flash 约 30.8%
 ```
 
 第一次构建会下载镜像、ESP32 工具链和依赖，后续使用 `moss-platformio-cache` Docker volume。
@@ -156,7 +156,7 @@ pio device monitor
 
 ## 控制界面
 
-### 固件内页面
+### 统一控制面板
 
 ESP32 联网后访问：
 
@@ -164,16 +164,19 @@ ESP32 联网后访问：
 http://<ESP32-IP>/
 ```
 
-当前固件内页面主要用于云台校准，支持：
+固件页面与公司环境的 Mock 预览使用同一份 [web/control-panel.html](web/control-panel.html)，构建时自动嵌入固件，不再维护两套界面。当前真实接通：
 
-- `±10`、`±50` 步点动
-- 停止并释放电机线圈
-- 捕获当前位置为最小值、中心或最大值
-- 数值修改 min/center/max
-- 电机方向反转
-- 保存到 NVS
+- 系统状态、电池、运行时间和可用内存
+- AP 配网、Wi-Fi 扫描、保存与清除网络配置
+- 云台点动、停止、回中、软限位捕获、方向反转和 NVS 保存
+- 摄像头启停、分辨率、JPEG 质量和拍照
+- OLED 文字、字号、旋转和清屏
+- WS2812 颜色、效果和亮度
+- 麦克风电平、扬声器测试、自检、重启和状态导出
 
-### 完整控制台原型
+Agent、自动化规则和可配置电源策略在界面中保留入口，但会显示“待接入”并禁用，避免产生虚假的保存结果。
+
+### 公司环境预览
 
 公司环境可启动本地 Mock：
 
@@ -187,17 +190,7 @@ python tools\control_panel_preview.py
 http://127.0.0.1:8766
 ```
 
-原型包含：
-
-- 系统总览
-- 云台控制
-- 摄像头
-- OLED 与 LED
-- 语音与 Agent
-- 自动化规则
-- 网络、电源、Agent 网关与安全设置
-
-完整原型用于确认交互和信息架构。除电机模块外，其余页面需要随着对应固件 API 落地后逐步接入，不能视为已经完成的设备功能。
+默认端口被占用时可以指定其他端口，例如 `python tools\control_panel_preview.py --port 8767`。Mock 提供与固件页面所用接口一致的响应，适合在没有硬件的公司环境开发界面。
 
 ## 电机安全与校准
 
@@ -263,6 +256,8 @@ GET  /api/v1/audio/status
 ## 功耗计划
 
 续航问题是当前最高优先级之一。已确认的主要优化方向：
+
+当前固件默认禁用 Deep Sleep，避免设备失去网络后无法唤醒。日常待机将优先使用保持联网的 Idle/Online Sleep；后续评估由 HPT630 通过 USB 或外部唤醒线恢复 ESP32 的方案。
 
 - 电机运动完成、停止和异常时释放线圈
 - 摄像头按需上电并自动断电
